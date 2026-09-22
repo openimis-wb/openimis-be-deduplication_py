@@ -1,12 +1,34 @@
 import graphene
 from django.contrib.auth.models import AnonymousUser
+from django.db.models import Q
 
-from deduplication.gql_mutations import CreateDeduplicationReviewMutation, CreateDeduplicationPaymentReviewMutation
-from deduplication.gql_queries import DeduplicationSummaryGQLType, DeduplicationSummaryRowGQLType
+from core.schema import OrderedDjangoFilterConnectionField
+from deduplication.apps import DeduplicationConfig
+from deduplication.gql_mutations import (
+    CreateDeduplicationReviewMutation,
+    CreateDeduplicationPaymentReviewMutation,
+    RunDuplicateScanMutation,
+    ResolveDuplicateCandidateMutation,
+    CreateDuplicateReviewTasksMutation,
+)
+from deduplication.gql_queries import (
+    DeduplicationSummaryGQLType,
+    DeduplicationSummaryRowGQLType,
+    DuplicateCandidateGQLType,
+)
+from deduplication.models import DuplicateCandidate
 
 
 class Query(graphene.ObjectType):
     module_name = "tasks_management"
+
+    duplicate_candidates = OrderedDjangoFilterConnectionField(
+        DuplicateCandidateGQLType,
+        orderBy=graphene.List(of_type=graphene.String),
+        status=graphene.String(),
+        kind=graphene.String(),
+        subjectId=graphene.String(),
+    )
 
     beneficiary_deduplication_summary = graphene.Field(
         DeduplicationSummaryGQLType,
@@ -69,6 +91,22 @@ class Query(graphene.ObjectType):
 
         return DeduplicationSummaryGQLType(rows=rows)
 
+    def resolve_duplicate_candidates(self, info, **kwargs):
+        Query._check_permissions(info.context.user, DeduplicationConfig.gql_query_duplicates_perms)
+
+        filters = []
+        status = kwargs.get("status")
+        if status:
+            filters.append(Q(status=status))
+        kind = kwargs.get("kind")
+        if kind:
+            filters.append(Q(kind=kind))
+        subject_id = kwargs.get("subjectId")
+        if subject_id:
+            filters.append(Q(subject_a=subject_id) | Q(subject_b=subject_id))
+
+        return DuplicateCandidate.objects.filter(*filters)
+
     @staticmethod
     def _check_permissions(user, perms):
         if type(user) is AnonymousUser or not user.id or not user.has_perms(perms):
@@ -78,3 +116,6 @@ class Query(graphene.ObjectType):
 class Mutation(graphene.ObjectType):
     create_deduplication_tasks = CreateDeduplicationReviewMutation.Field()
     create_deduplication_payment_tasks = CreateDeduplicationPaymentReviewMutation.Field()
+    run_duplicate_scan = RunDuplicateScanMutation.Field()
+    resolve_duplicate_candidate = ResolveDuplicateCandidateMutation.Field()
+    create_duplicate_review_tasks = CreateDuplicateReviewTasksMutation.Field()
