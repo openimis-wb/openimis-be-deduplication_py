@@ -9,6 +9,7 @@ DEFAULT_CONFIG = {
     "subject_model": "individual.Individual",
     "demographic_columns": ["first_name", "last_name", "dob"],
     "identifier_keys": [],
+    "identifier_match": "each",
     "merge_policy": "delete",
 }
 
@@ -25,6 +26,7 @@ class DeduplicationConfig(AppConfig):
     subject_model = None
     demographic_columns = None
     identifier_keys = None
+    identifier_match = None
     merge_policy = None
 
     def ready(self):

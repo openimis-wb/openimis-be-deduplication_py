@@ -28,8 +28,12 @@ Two built-in sources are registered automatically (`DeduplicationConfig.ready()`
 - `DemographicSource` (`deduplication/sources/demographic.py`) groups subjects sharing the
   same values on `demographic_columns` (module config, default `first_name`, `last_name`,
   `dob`; a name not on the subject model is read as a `json_ext` key).
-- `IdentifierSource` (`deduplication/sources/identifier.py`) exact-matches subjects on each
-  `identifier_keys` `json_ext` key independently, normalised (trimmed, case-folded).
+- `IdentifierSource` (`deduplication/sources/identifier.py`) matches subjects on
+  `identifier_keys` `json_ext` keys, normalised (trimmed, case-folded). `identifier_match`
+  selects the mode: `"each"` (default) matches a pair when any single key is equal;
+  `"all"` matches only when every configured key is equal and non-empty for both
+  subjects, and evidence then carries every key's value. Any other value raises
+  `ImproperlyConfigured` when the source scans.
 
 Both scan the configured subject model (`subject_model`, default `individual.Individual`,
 resolved with `django.apps.apps.get_model`).
@@ -85,6 +89,7 @@ Loaded the same way as the legacy rights, via `ModuleConfiguration` onto
 | `subject_model` | `"individual.Individual"` |
 | `demographic_columns` | `["first_name", "last_name", "dob"]` |
 | `identifier_keys` | `[]` |
+| `identifier_match` | `"each"` |
 | `merge_policy` | `"delete"` |
 | `gql_create_deduplication_review_perms` | `["172001"]` |
 | `gql_create_deduplication_payment_review_perms` | `["172002"]` |
