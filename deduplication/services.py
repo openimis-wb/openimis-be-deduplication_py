@@ -1,9 +1,10 @@
 import copy
 import logging
 from functools import lru_cache
-from typing import List, Union, Tuple, Type
+from typing import Dict, List, Optional, Union, Tuple, Type
 from datetime import datetime
 
+from django.apps import apps
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.core.exceptions import FieldDoesNotExist
 from django.db import models
@@ -15,7 +16,12 @@ from django.db import transaction
 from core.datetimes.ad_datetime import AdDate
 from core.models import ExtendableModel, HistoryModel, User, HistoryBusinessModel
 from core.services.utils import model_representation, output_exception
+from core.signals import register_service_signal
 from core.utils import to_json_safe_value
+from deduplication.apps import DeduplicationConfig
+from deduplication.column_resolution import resolve_columns, is_model_column
+from deduplication.models import DuplicateCandidate, ScanState
+from deduplication.sources import Candidate, Watermark, order_pair, sources as registered_sources
 from deduplication.validations import CreateDeduplicationReviewTasksValidation, \
     CreateDeduplicationPaymentReviewTasksValidation
 from individual.models import Individual
@@ -345,23 +351,11 @@ def get_duplication_benefit_aggregation(
 
 def _resolve_columns(model: Union[Type[ExtendableModel], Type[HistoryModel]], columns: List[str]) -> Tuple[
         List[str], List[str]]:
-    fields = []
-    json_fields = []
-    for column in columns:
-        if _is_model_column(model, column.split('__', 1)[0]):
-            fields.append(column)
-        else:
-            json_fields.append(column)
-
-    return fields, json_fields
+    return resolve_columns(model, columns)
 
 
 def _is_model_column(model: Union[Type[ExtendableModel], Type[HistoryModel]], column: str) -> bool:
-    try:
-        model._meta.get_field(column)
-        return True
-    except FieldDoesNotExist:
-        return False
+    return is_model_column(model, column)
 
 
 def _update_instance_if_different_value(instance, instance_kwargs, user):
@@ -492,4 +486,278 @@ def on_payment_benefit_deduplication_task_complete_service_handler(**kwargs):
             remove_duplicate_benefit_payments(task)
     except Exception as e:
         logger.error("Error while executing on_task_complete", exc_info=e)
+        return [str(e)]
+
+
+# --- Candidate sources: recording, scanning, resolving, merging (seam §4) ---
+
+DUPLICATE_CANDIDATE_TASK_SOURCE = "deduplication_candidate"
+
+
+def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, bool]:
+    """Get-or-create a DuplicateCandidate for c's unique key; never reopens a dismissed row."""
+    subject_a, subject_b = order_pair(c.subject_a, c.subject_b)
+    obj, created = DuplicateCandidate.objects.get_or_create(
+        subject_model=c.subject_model, subject_a=subject_a, subject_b=subject_b, kind=c.kind,
+        defaults={'source': source, 'score': c.score, 'evidence': c.evidence or {}},
+    )
+    if created:
+        return obj, True
+    if obj.status != DuplicateCandidate.Status.OPEN:
+        return obj, False
+
+    changed = False
+    if c.score is not None and (obj.score is None or c.score > obj.score):
+        obj.score = c.score
+        changed = True
+    merged_evidence = {**(obj.evidence or {}), **(c.evidence or {})}
+    if merged_evidence != (obj.evidence or {}):
+        obj.evidence = merged_evidence
+        changed = True
+    if changed:
+        obj.save()
+    return obj, False
+
+
+def run_scan(*, kinds: Optional[List[str]] = None, actor) -> Dict[str, int]:
+    """Scan registered sources (optionally filtered by kind), record candidates, advance watermarks."""
+    counts = {}
+    for source in registered_sources():
+        if kinds and source.kind not in kinds:
+            continue
+        state, _created = ScanState.objects.get_or_create(kind=source.kind)
+        since = None
+        if state.updated_at is not None or state.last_id:
+            since = Watermark(updated_at=state.updated_at, last_id=state.last_id or None)
+
+        count = 0
+        for candidate in source.scan(since):
+            record_candidate(candidate, source=type(source).__name__)
+            count += 1
+
+        new_watermark = source.watermark()
+        state.updated_at = new_watermark.updated_at
+        state.last_id = new_watermark.last_id or ""
+        state.last_scan_at = datetime.now()
+        state.summary = {'count': count}
+        state.save()
+        counts[source.kind] = count
+    return counts
+
+
+def scan_subject(subject_model: str, subject_id: str) -> List[DuplicateCandidate]:
+    """On-demand full scan across all sources, recording only pairs touching subject_id."""
+    subject_id = str(subject_id)
+    results = []
+    for source in registered_sources():
+        for candidate in source.scan(None):
+            if candidate.subject_model != subject_model:
+                continue
+            if subject_id not in (candidate.subject_a, candidate.subject_b):
+                continue
+            obj, _created = record_candidate(candidate, source=type(source).__name__)
+            results.append(obj)
+    return results
+
+
+class _MergeSignalEmitter:
+    """Wraps the signal-carrying call so `deduplication.subject_merged` fires with a clean payload."""
+
+    @classmethod
+    @register_service_signal('deduplication.subject_merged')
+    def emit(cls, *, subject_model, kept_id, retired_id, actor, policy):
+        return {
+            'subject_model': subject_model,
+            'kept_id': kept_id,
+            'retired_id': retired_id,
+            'actor': actor,
+            'policy': policy,
+        }
+
+
+_SUBJECT_AUDIT_FIELD_NAMES = (
+    {f.name for f in HistoryModel._meta.fields}
+    | {f.name for f in HistoryBusinessModel._meta.fields}
+    | {'json_ext'}
+)
+
+
+def _is_empty(value) -> bool:
+    return value is None or value == ""
+
+
+def _mergeable_fields(model):
+    return [f for f in model._meta.fields if f.name not in _SUBJECT_AUDIT_FIELD_NAMES]
+
+
+def _merge_field_values(kept, retired, actor) -> bool:
+    """Fill empty fields on kept from retired; journal differing non-empty values, never overwrite."""
+    changed = False
+    conflicts = []
+    now = datetime.now()
+
+    for f in _mergeable_fields(type(kept)):
+        kept_value = getattr(kept, f.attname)
+        retired_value = getattr(retired, f.attname)
+        if _is_empty(kept_value) and not _is_empty(retired_value):
+            setattr(kept, f.attname, retired_value)
+            changed = True
+        elif not _is_empty(kept_value) and not _is_empty(retired_value) and kept_value != retired_value:
+            conflicts.append({
+                'field': f.name,
+                'kept': to_json_safe_value(kept_value),
+                'retired': to_json_safe_value(retired_value),
+                'retired_id': str(retired.id),
+                'at': now.isoformat(),
+                'actor': actor.username,
+            })
+
+    kept_ext = dict(kept.json_ext or {})
+    retired_ext = dict(retired.json_ext or {})
+    for key, retired_value in retired_ext.items():
+        if key == 'merge_conflicts':
+            continue
+        kept_value = kept_ext.get(key)
+        if _is_empty(kept_value) and not _is_empty(retired_value):
+            kept_ext[key] = retired_value
+            changed = True
+        elif not _is_empty(kept_value) and not _is_empty(retired_value) and kept_value != retired_value:
+            conflicts.append({
+                'field': key,
+                'kept': to_json_safe_value(kept_value),
+                'retired': to_json_safe_value(retired_value),
+                'retired_id': str(retired.id),
+                'at': now.isoformat(),
+                'actor': actor.username,
+            })
+
+    if conflicts:
+        kept_ext['merge_conflicts'] = kept_ext.get('merge_conflicts', []) + conflicts
+        changed = True
+
+    kept.json_ext = kept_ext
+    return changed
+
+
+@transaction.atomic
+def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
+    """
+    Merge retired into kept: fill-empty + conflict journal on both policies, then
+    soft-delete retired ("delete") or mark it retired_into kept before soft-deleting ("retire").
+    Emits deduplication.subject_merged after the transaction commits.
+    """
+    policy = policy or DeduplicationConfig.merge_policy
+    if policy not in ('delete', 'retire'):
+        raise ValueError(f"unknown merge policy {policy!r}")
+
+    changed = _merge_field_values(kept, retired, actor)
+    if changed:
+        kept.save(user=actor)
+
+    subject_model_label = type(kept)._meta.label
+    kept_id = str(kept.id)
+    retired_id = str(retired.id)
+
+    if policy == 'retire':
+        retired_ext = dict(retired.json_ext or {})
+        retired_ext['retired_into'] = kept_id
+        retired.json_ext = retired_ext
+        retired.save(user=actor)
+    retired.delete(user=actor)
+
+    transaction.on_commit(lambda: _MergeSignalEmitter.emit(
+        subject_model=subject_model_label, kept_id=kept_id, retired_id=retired_id,
+        actor=actor.username, policy=policy,
+    ))
+    return kept
+
+
+def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None, actor, note: str = ""):
+    """different -> DISMISSED. same -> merge_subjects then CONFIRMED. Never reopens a dismissed row."""
+    if decision not in ('same', 'different'):
+        raise ValueError(f"unknown decision {decision!r}")
+    if candidate.status == DuplicateCandidate.Status.DISMISSED:
+        return candidate
+
+    with transaction.atomic():
+        if decision == 'different':
+            candidate.status = DuplicateCandidate.Status.DISMISSED
+        else:
+            keep_id = keep or candidate.subject_a
+            retired_id = candidate.subject_b if keep_id == candidate.subject_a else candidate.subject_a
+            model = apps.get_model(candidate.subject_model)
+            kept = model.objects.get(id=keep_id)
+            retired = model.objects.get(id=retired_id)
+            merge_subjects(kept, retired, actor)
+            candidate.status = DuplicateCandidate.Status.CONFIRMED
+
+        candidate.reviewed_by = actor.username
+        candidate.reviewed_at = datetime.now()
+        candidate.decision_note = note
+        candidate.save()
+    return candidate
+
+
+def create_review_tasks(candidate_ids, actor) -> dict:
+    """Create one tasks_management.Task per candidate, source=deduplication_candidate, task FK set."""
+    try:
+        task_service = TaskService(actor)
+        tasks = []
+        for candidate in DuplicateCandidate.objects.filter(id__in=candidate_ids):
+            task_data = {
+                'source': DUPLICATE_CANDIDATE_TASK_SOURCE,
+                'executor_action_event': TasksManagementConfig.default_executor_event,
+                'business_event': '',
+                'data': {
+                    'id': str(candidate.id),
+                    'subject_model': candidate.subject_model,
+                    'subject_a': candidate.subject_a,
+                    'subject_b': candidate.subject_b,
+                    'kind': candidate.kind,
+                    'score': candidate.score,
+                    'evidence': candidate.evidence,
+                },
+            }
+            result = task_service.create(task_data)
+            if result.get('success'):
+                candidate.task_id = result['data']['id']
+                candidate.save()
+            tasks.append(result)
+        return {"success": True, "message": "Ok", "detail": "", "data": tasks}
+    except Exception as exc:
+        return output_exception(model_name='DuplicateCandidate', method="create_review_tasks", exception=exc)
+
+
+def on_duplicate_candidate_task_complete_service_handler(**kwargs):
+    """Bridge: a completed deduplication_candidate task resolves its candidate with the reviewer's decision."""
+    try:
+        result = kwargs.get('result', {})
+        if not result or not result.get('success'):
+            return
+        task = result['data']['task']
+        if task.get('source') != DUPLICATE_CANDIDATE_TASK_SOURCE:
+            return
+        if task.get('status') != Task.Status.COMPLETED:
+            return
+
+        candidate_id = (task.get('data') or {}).get('id')
+        if not candidate_id:
+            return
+        additional_resolve_data = (task.get('json_ext') or {}).get('additional_resolve_data', {})
+        if not additional_resolve_data:
+            return
+        resolve_data = next(iter(additional_resolve_data.values()))
+
+        user_id = result['data']['user']['id']
+        actor = User.objects.get(id=user_id)
+        candidate = DuplicateCandidate.objects.get(id=candidate_id)
+        resolve(
+            candidate,
+            decision=resolve_data.get('decision'),
+            keep=resolve_data.get('keep'),
+            actor=actor,
+            note=resolve_data.get('note', ''),
+        )
+    except Exception as e:
+        logger.error("Error while executing on_duplicate_candidate_task_complete", exc_info=e)
         return [str(e)]
