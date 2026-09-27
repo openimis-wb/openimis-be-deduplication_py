@@ -58,7 +58,10 @@ Services (`deduplication/services.py`):
 - `resolve(candidate, decision="same"|"different", keep=None, actor=..., note="")` —
   `different` dismisses the candidate; `same` merges the subjects (see below) and confirms
   it. Only an `OPEN` candidate is resolved: the row is re-read under a lock, and a
-  `CONFIRMED` or `DISMISSED` candidate is returned unchanged.
+  `CONFIRMED` or `DISMISSED` candidate is returned unchanged. A `same` decision raises
+  `ValueError` and leaves the candidate `OPEN` when `keep` is not one of the pair's two
+  subjects (`deduplication.resolve.keep_not_in_pair`) or when either subject is already
+  soft-deleted (`deduplication.resolve.subject_deleted`).
 - `create_review_tasks(candidate_ids, actor)` — one `tasks_management.Task` per `OPEN`
   candidate that has no `RECEIVED`/`ACCEPTED` task (`source="deduplication_candidate"`),
   FK'd back onto the candidate; other ids are skipped. Completing such a task

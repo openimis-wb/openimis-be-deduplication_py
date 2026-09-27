@@ -158,3 +158,38 @@ class TaskBridgeTest(TestCase):
         candidate.refresh_from_db()
         self.assertIsNotNone(candidate.task_id)
         self.assertNotEqual(candidate.task_id, first_task_id)
+
+    def _complete_task_with(self, candidate, additional_data):
+        create_review_tasks([candidate.id], self.user)
+        candidate.refresh_from_db()
+        task_service = TaskService(self.user)
+        task_service.resolve_task({
+            'id': candidate.task_id,
+            'business_status': {},
+            'additional_data': additional_data,
+        })
+        task_service.complete_task({'id': candidate.task_id})
+
+    def test_completing_task_with_a_keep_outside_the_pair_changes_nothing(self):
+        a, b, candidate = self._make_pair()
+        x = Individual(first_name="X", last_name="Outside", dob="1985-05-05")
+        x.save(username=self.user.username)
+
+        self._complete_task_with(candidate, {'decision': 'same', 'keep': str(x.id), 'note': 'wrong keep'})
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.OPEN)
+        for subject in (a, b, x):
+            subject.refresh_from_db()
+            self.assertFalse(subject.is_deleted)
+
+    def test_completing_task_keeping_a_soft_deleted_subject_changes_nothing(self):
+        a, b, candidate = self._make_pair()
+        a.delete(user=self.user)
+
+        self._complete_task_with(candidate, {'decision': 'same', 'keep': str(a.id), 'note': 'deleted keep'})
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.OPEN)
+        b.refresh_from_db()
+        self.assertFalse(b.is_deleted)

@@ -137,3 +137,46 @@ class DuplicateCandidateSchemaTest(openIMISGraphQLTestCase):
 
         candidate.refresh_from_db()
         self.assertEqual(candidate.status, DuplicateCandidate.Status.CONFIRMED)
+
+    def _resolve_same(self, keep, client_mutation_id):
+        mutation = """
+        mutation ResolveDuplicateCandidate($input: ResolveDuplicateCandidateMutationInput!) {
+          resolveDuplicateCandidate(input: $input) { clientMutationId internalId }
+        }
+        """
+        response = self.query(
+            mutation,
+            variables={"input": {
+                "id": str(self.candidate.id), "decision": "same", "keep": keep,
+                "clientMutationId": client_mutation_id,
+            }},
+            headers={"HTTP_AUTHORIZATION": f"Bearer {self.user_token}"}
+        )
+        self.assertResponseNoErrors(response)
+        return MutationLog.objects.get(client_mutation_id=client_mutation_id)
+
+    def test_resolve_mutation_refuses_a_keep_outside_the_pair(self):
+        x = Individual(first_name="X", last_name="Outside", dob="1985-05-05")
+        x.save(username=self.user.username)
+
+        log = self._resolve_same(str(x.id), "resolve-outsider")
+
+        self.assertEqual(log.status, MutationLog.ERROR)
+        self.assertIn("deduplication.resolve.keep_not_in_pair", log.error)
+        self.candidate.refresh_from_db()
+        self.assertEqual(self.candidate.status, DuplicateCandidate.Status.OPEN)
+        for subject in (self.a, self.b, x):
+            subject.refresh_from_db()
+            self.assertFalse(subject.is_deleted)
+
+    def test_resolve_mutation_refuses_a_soft_deleted_kept_subject(self):
+        self.a.delete(user=self.user)
+
+        log = self._resolve_same(str(self.a.id), "resolve-deleted-keep")
+
+        self.assertEqual(log.status, MutationLog.ERROR)
+        self.assertIn("deduplication.resolve.subject_deleted", log.error)
+        self.candidate.refresh_from_db()
+        self.assertEqual(self.candidate.status, DuplicateCandidate.Status.OPEN)
+        self.b.refresh_from_db()
+        self.assertFalse(self.b.is_deleted)

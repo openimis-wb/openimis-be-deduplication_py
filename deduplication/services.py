@@ -679,6 +679,8 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
     Only an OPEN candidate is resolved. The row is re-read under a row lock, and a
     candidate that is already CONFIRMED or DISMISSED is returned unchanged, so a
     stale decision never merges into a retired subject nor flips a merged pair.
+    A "same" decision raises ValueError, leaving the candidate OPEN, when keep is
+    not one of the pair's two subjects or when either subject is soft-deleted.
     """
     if decision not in ('same', 'different'):
         raise ValueError(f"unknown decision {decision!r}")
@@ -690,11 +692,15 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
         if decision == 'different':
             candidate.status = DuplicateCandidate.Status.DISMISSED
         else:
-            keep_id = keep or candidate.subject_a
+            keep_id = str(keep) if keep else candidate.subject_a
+            if keep_id not in (candidate.subject_a, candidate.subject_b):
+                raise ValueError("deduplication.resolve.keep_not_in_pair")
             retired_id = candidate.subject_b if keep_id == candidate.subject_a else candidate.subject_a
             model = apps.get_model(candidate.subject_model)
             kept = model.objects.get(id=keep_id)
             retired = model.objects.get(id=retired_id)
+            if getattr(kept, 'is_deleted', False) or getattr(retired, 'is_deleted', False):
+                raise ValueError("deduplication.resolve.subject_deleted")
             merge_subjects(kept, retired, actor)
             candidate.status = DuplicateCandidate.Status.CONFIRMED
 

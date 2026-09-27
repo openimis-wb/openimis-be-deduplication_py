@@ -100,3 +100,47 @@ class ResolveTest(TestCase):
         b.refresh_from_db()
         self.assertFalse(a.is_deleted)
         self.assertTrue(b.is_deleted)
+
+    def _make_outsider(self):
+        x = Individual(first_name="X", last_name="Outside", dob="1985-05-05")
+        x.save(username=self.user.username)
+        return x
+
+    def test_resolve_refuses_a_keep_outside_the_pair(self):
+        a, b, candidate = self._make_pair()
+        x = self._make_outsider()
+
+        with self.assertRaisesMessage(ValueError, "deduplication.resolve.keep_not_in_pair"):
+            resolve(candidate, decision="same", keep=str(x.id), actor=self.user)
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.OPEN)
+        self.assertEqual(candidate.reviewed_by, "")
+        for subject in (a, b, x):
+            subject.refresh_from_db()
+            self.assertFalse(subject.is_deleted)
+        self.assertNotIn('merge_conflicts', x.json_ext or {})
+
+    def test_resolve_refuses_a_soft_deleted_kept_subject(self):
+        a, b, candidate = self._make_pair()
+        a.delete(user=self.user)
+
+        with self.assertRaisesMessage(ValueError, "deduplication.resolve.subject_deleted"):
+            resolve(candidate, decision="same", keep=str(a.id), actor=self.user)
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.OPEN)
+        b.refresh_from_db()
+        self.assertFalse(b.is_deleted)
+
+    def test_resolve_refuses_a_soft_deleted_retired_subject(self):
+        a, b, candidate = self._make_pair()
+        b.delete(user=self.user)
+
+        with self.assertRaisesMessage(ValueError, "deduplication.resolve.subject_deleted"):
+            resolve(candidate, decision="same", keep=str(a.id), actor=self.user)
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.OPEN)
+        a.refresh_from_db()
+        self.assertFalse(a.is_deleted)
