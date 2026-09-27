@@ -1,7 +1,7 @@
 from django.test import TestCase
 
 from deduplication.models import DuplicateCandidate
-from deduplication.services import create_review_tasks
+from deduplication.services import create_review_tasks, resolve
 from deduplication.sources import order_pair
 from deduplication.tests.helpers import LogInHelper
 from individual.models import Individual
@@ -80,3 +80,81 @@ class TaskBridgeTest(TestCase):
         b.refresh_from_db()
         self.assertFalse(a.is_deleted)
         self.assertFalse(b.is_deleted)
+
+    def test_stale_task_does_not_merge_into_the_retired_subject(self):
+        a, b, candidate = self._make_pair()
+        create_review_tasks([candidate.id], self.user)
+        candidate.refresh_from_db()
+        task_id = candidate.task_id
+        resolve(candidate, decision="same", keep=str(a.id), actor=self.user, note="decided on the page")
+
+        task_service = TaskService(self.user)
+        task_service.resolve_task({
+            'id': task_id,
+            'business_status': {},
+            'additional_data': {'decision': 'same', 'keep': str(b.id), 'note': 'stale task'},
+        })
+        task_service.complete_task({'id': task_id})
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.CONFIRMED)
+        self.assertEqual(candidate.decision_note, "decided on the page")
+        a.refresh_from_db()
+        b.refresh_from_db()
+        self.assertFalse(a.is_deleted)
+        self.assertTrue(b.is_deleted)
+
+    def test_stale_different_task_keeps_a_merged_pair_confirmed(self):
+        a, b, candidate = self._make_pair()
+        create_review_tasks([candidate.id], self.user)
+        candidate.refresh_from_db()
+        task_id = candidate.task_id
+        resolve(candidate, decision="same", keep=str(a.id), actor=self.user)
+
+        task_service = TaskService(self.user)
+        task_service.resolve_task({
+            'id': task_id,
+            'business_status': {},
+            'additional_data': {'decision': 'different', 'note': 'stale task'},
+        })
+        task_service.complete_task({'id': task_id})
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.CONFIRMED)
+
+    def test_create_review_tasks_skips_resolved_candidates(self):
+        a, b, candidate = self._make_pair()
+        resolve(candidate, decision="same", keep=str(a.id), actor=self.user)
+
+        result = create_review_tasks([candidate.id], self.user)
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['data'], [])
+        candidate.refresh_from_db()
+        self.assertIsNone(candidate.task_id)
+
+    def test_create_review_tasks_skips_a_candidate_with_an_open_task(self):
+        a, b, candidate = self._make_pair()
+        create_review_tasks([candidate.id], self.user)
+        candidate.refresh_from_db()
+        first_task_id = candidate.task_id
+
+        result = create_review_tasks([candidate.id], self.user)
+
+        self.assertEqual(result['data'], [])
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.task_id, first_task_id)
+        self.assertEqual(Task.objects.filter(data__id=str(candidate.id)).count(), 1)
+
+    def test_create_review_tasks_replaces_a_closed_task(self):
+        a, b, candidate = self._make_pair()
+        create_review_tasks([candidate.id], self.user)
+        candidate.refresh_from_db()
+        first_task_id = candidate.task_id
+        Task.objects.filter(id=first_task_id).update(status=Task.Status.FAILED)
+
+        create_review_tasks([candidate.id], self.user)
+
+        candidate.refresh_from_db()
+        self.assertIsNotNone(candidate.task_id)
+        self.assertNotEqual(candidate.task_id, first_task_id)

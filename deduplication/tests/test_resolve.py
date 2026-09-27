@@ -64,3 +64,39 @@ class ResolveTest(TestCase):
         b.refresh_from_db()
         self.assertFalse(a.is_deleted)
         self.assertFalse(b.is_deleted)
+
+    def test_resolve_leaves_a_confirmed_candidate_unchanged(self):
+        a, b, candidate = self._make_pair()
+        resolve(candidate, decision="same", keep=str(a.id), actor=self.user, note="first decision")
+
+        resolve(candidate, decision="same", keep=str(b.id), actor=self.user, note="stale decision")
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.CONFIRMED)
+        self.assertEqual(candidate.decision_note, "first decision")
+        a.refresh_from_db()
+        b.refresh_from_db()
+        self.assertFalse(a.is_deleted)
+        self.assertTrue(b.is_deleted)
+
+    def test_resolve_never_dismisses_a_confirmed_candidate(self):
+        a, b, candidate = self._make_pair()
+        resolve(candidate, decision="same", keep=str(a.id), actor=self.user)
+
+        resolve(candidate, decision="different", actor=self.user, note="stale decision")
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.CONFIRMED)
+        self.assertEqual(candidate.decision_note, "")
+
+    def test_resolve_reads_the_current_status_not_the_passed_instance(self):
+        a, b, candidate = self._make_pair()
+        stale = DuplicateCandidate.objects.get(id=candidate.id)
+        resolve(candidate, decision="same", keep=str(a.id), actor=self.user)
+
+        resolve(stale, decision="same", keep=str(b.id), actor=self.user)
+
+        a.refresh_from_db()
+        b.refresh_from_db()
+        self.assertFalse(a.is_deleted)
+        self.assertTrue(b.is_deleted)

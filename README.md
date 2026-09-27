@@ -57,9 +57,11 @@ Services (`deduplication/services.py`):
   subject.
 - `resolve(candidate, decision="same"|"different", keep=None, actor=..., note="")` —
   `different` dismisses the candidate; `same` merges the subjects (see below) and confirms
-  it. A dismissed candidate is never reopened.
-- `create_review_tasks(candidate_ids, actor)` — one `tasks_management.Task` per candidate
-  (`source="deduplication_candidate"`), FK'd back onto the candidate. Completing such a task
+  it. Only an `OPEN` candidate is resolved: the row is re-read under a lock, and a
+  `CONFIRMED` or `DISMISSED` candidate is returned unchanged.
+- `create_review_tasks(candidate_ids, actor)` — one `tasks_management.Task` per `OPEN`
+  candidate that has no `RECEIVED`/`ACCEPTED` task (`source="deduplication_candidate"`),
+  FK'd back onto the candidate; other ids are skipped. Completing such a task
   (existing `task_service.complete_task` flow) resolves the candidate from
   `task.json_ext["additional_resolve_data"]` (`{"decision", "keep", "note"}`).
 
@@ -103,7 +105,8 @@ Loaded the same way as the legacy rights, via `ModuleConfiguration` onto
   connection over `DuplicateCandidate` (`gql_query_duplicates_perms`).
 - `runDuplicateScan(kinds)` — mutation, runs `run_scan` (`gql_run_scan_perms`).
 - `resolveDuplicateCandidate(id, decision, keep, note)` — mutation, runs `resolve`
-  (`gql_resolve_duplicate_perms`).
+  (`gql_resolve_duplicate_perms`); fails with `deduplication.mutation.candidate_not_open`
+  when the candidate is no longer `OPEN`.
 - `createDuplicateReviewTasks(ids)` — mutation, runs `create_review_tasks`
   (`gql_create_deduplication_review_perms`, same right as the legacy
   `createDeduplicationTasks`).

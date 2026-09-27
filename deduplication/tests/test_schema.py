@@ -95,3 +95,27 @@ class DuplicateCandidateSchemaTest(openIMISGraphQLTestCase):
 
         self.candidate.refresh_from_db()
         self.assertIsNotNone(self.candidate.task_id)
+
+    def test_resolve_mutation_refuses_a_resolved_candidate(self):
+        candidate = DuplicateCandidate.objects.get(id=self.candidate.id)
+        candidate.status = DuplicateCandidate.Status.CONFIRMED
+        candidate.save()
+        mutation = """
+        mutation ResolveDuplicateCandidate($input: ResolveDuplicateCandidateMutationInput!) {
+          resolveDuplicateCandidate(input: $input) { clientMutationId internalId }
+        }
+        """
+        response = self.query(
+            mutation,
+            variables={"input": {
+                "id": str(self.candidate.id), "decision": "different", "clientMutationId": "resolve-stale",
+            }},
+            headers={"HTTP_AUTHORIZATION": f"Bearer {self.user_token}"}
+        )
+        self.assertResponseNoErrors(response)
+        log = MutationLog.objects.get(client_mutation_id="resolve-stale")
+        self.assertEqual(log.status, MutationLog.ERROR)
+        self.assertIn("deduplication.mutation.candidate_not_open", log.error)
+
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.CONFIRMED)

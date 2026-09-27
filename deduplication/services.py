@@ -492,6 +492,7 @@ def on_payment_benefit_deduplication_task_complete_service_handler(**kwargs):
 # --- Candidate sources: recording, scanning, resolving, merging (seam §4) ---
 
 DUPLICATE_CANDIDATE_TASK_SOURCE = "deduplication_candidate"
+OPEN_TASK_STATUSES = (Task.Status.RECEIVED, Task.Status.ACCEPTED)
 
 
 def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, bool]:
@@ -673,13 +674,19 @@ def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
 
 
 def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None, actor, note: str = ""):
-    """different -> DISMISSED. same -> merge_subjects then CONFIRMED. Never reopens a dismissed row."""
+    """different -> DISMISSED. same -> merge_subjects then CONFIRMED.
+
+    Only an OPEN candidate is resolved. The row is re-read under a row lock, and a
+    candidate that is already CONFIRMED or DISMISSED is returned unchanged, so a
+    stale decision never merges into a retired subject nor flips a merged pair.
+    """
     if decision not in ('same', 'different'):
         raise ValueError(f"unknown decision {decision!r}")
-    if candidate.status == DuplicateCandidate.Status.DISMISSED:
-        return candidate
 
     with transaction.atomic():
+        candidate = DuplicateCandidate.objects.select_for_update().get(pk=candidate.pk)
+        if candidate.status != DuplicateCandidate.Status.OPEN:
+            return candidate
         if decision == 'different':
             candidate.status = DuplicateCandidate.Status.DISMISSED
         else:
@@ -699,11 +706,20 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
 
 
 def create_review_tasks(candidate_ids, actor) -> dict:
-    """Create one tasks_management.Task per candidate, source=deduplication_candidate, task FK set."""
+    """Create one tasks_management.Task per candidate, source=deduplication_candidate, task FK set.
+
+    Only OPEN candidates without a RECEIVED or ACCEPTED task get a task; the others
+    are skipped, so a pair never has two pending decisions.
+    """
     try:
         task_service = TaskService(actor)
         tasks = []
-        for candidate in DuplicateCandidate.objects.filter(id__in=candidate_ids):
+        eligible = (
+            DuplicateCandidate.objects
+            .filter(id__in=candidate_ids, status=DuplicateCandidate.Status.OPEN)
+            .exclude(task__status__in=OPEN_TASK_STATUSES)
+        )
+        for candidate in eligible:
             task_data = {
                 'source': DUPLICATE_CANDIDATE_TASK_SOURCE,
                 'executor_action_event': TasksManagementConfig.default_executor_event,
