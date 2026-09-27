@@ -45,6 +45,24 @@ class DuplicateCandidateSchemaTest(openIMISGraphQLTestCase):
         data = json.loads(response.content)['data']['duplicateCandidates']
         self.assertGreaterEqual(data['totalCount'], 1)
 
+    def test_duplicate_candidate_by_uuid_variable_reports_status_and_task(self):
+        response = self.query(
+            """
+            query DuplicateCandidateStatus($id: ID) {
+              duplicateCandidates(id: $id, first: 1) {
+                edges { node { id status task { id status } } }
+              }
+            }
+            """,
+            variables={"id": str(self.candidate.id)},
+            headers={"HTTP_AUTHORIZATION": f"Bearer {self.user_token}"}
+        )
+        self.assertResponseNoErrors(response)
+        edges = json.loads(response.content)['data']['duplicateCandidates']['edges']
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0]['node']['status'], 'OPEN')
+        self.assertIsNone(edges[0]['node']['task'])
+
     def test_run_duplicate_scan_mutation(self):
         mutation = """
         mutation RunDuplicateScan($input: RunDuplicateScanMutationInput!) {
