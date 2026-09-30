@@ -244,3 +244,26 @@ class ResolveSameSubjectsAcrossKindsTest(TestCase):
 
         late.refresh_from_db()
         self.assertEqual(late.status, DuplicateCandidate.Status.OPEN)
+
+    def test_different_on_a_kind_whose_pair_is_already_merged_is_refused(self):
+        a, b = self._make_subjects()
+        resolve(self._candidate(a, b, "demographic"), decision="same", keep=str(a.id), actor=self.user)
+        late = self._candidate(a, b, "biometric")
+
+        with self.assertRaisesMessage(ValueError, "deduplication.resolve.pair_already_merged"):
+            resolve(late, decision="different", actor=self.user, note="late dismissal")
+
+        late.refresh_from_db()
+        self.assertEqual(late.status, DuplicateCandidate.Status.OPEN)
+        self.assertEqual(late.reviewed_by, "")
+        self.assertEqual(late.decision_note, "")
+
+    def test_different_is_still_allowed_next_to_a_dismissed_kind(self):
+        a, b = self._make_subjects()
+        resolve(self._candidate(a, b, "demographic"), decision="different", actor=self.user)
+        other = self._candidate(a, b, "identifier")
+
+        resolve(other, decision="different", actor=self.user)
+
+        other.refresh_from_db()
+        self.assertEqual(other.status, DuplicateCandidate.Status.DISMISSED)

@@ -763,7 +763,9 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
     CONFIRMED in the same transaction. A "same" on a candidate whose pair already has a
     CONFIRMED sibling is CONFIRMED without a second merge when keep is the surviving
     subject and the other one is deleted; a keep that contradicts the merge is refused
-    with deduplication.resolve.keep_contradicts_merge.
+    with deduplication.resolve.keep_contradicts_merge. A "different" on a candidate whose
+    pair already has a CONFIRMED sibling is refused with
+    deduplication.resolve.pair_already_merged, leaving the candidate OPEN.
     """
     if decision not in ('same', 'different'):
         raise ValueError(f"unknown decision {decision!r}")
@@ -773,6 +775,8 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
         if candidate.status != DuplicateCandidate.Status.OPEN:
             return candidate
         if decision == 'different':
+            if _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists():
+                raise ValueError("deduplication.resolve.pair_already_merged")
             candidate.status = DuplicateCandidate.Status.DISMISSED
         else:
             keep_id = str(keep) if keep else candidate.subject_a

@@ -349,7 +349,9 @@ together. In the merge transaction every other `OPEN` candidate on the same unor
 `CONFIRMED` with the same decision, and a `DISMISSED` one stays dismissed. A `same` on a candidate
 whose pair already has a `CONFIRMED` sibling becomes `CONFIRMED` without a second merge when `keep`
 is the surviving subject and the other subject is deleted; a `keep` naming the deleted subject is
-refused with `deduplication.resolve.keep_contradicts_merge`.
+refused with `deduplication.resolve.keep_contradicts_merge`. A `different` on a candidate whose
+pair already has a `CONFIRMED` sibling is refused with `deduplication.resolve.pair_already_merged`;
+the candidate stays `OPEN`.
 
 Review through Tasks Management stays available: `create_review_tasks(candidate_ids, actor)`
 creates one `tasks_management.Task` per candidate (`source="deduplication_candidate"`, `data` =
