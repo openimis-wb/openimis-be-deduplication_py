@@ -331,6 +331,13 @@ resolve(candidate, *, decision: "same"|"different", keep: str | None = None, act
   (`.delete(user=…)` on a `HistoryModel`). `delete`: the model's soft delete only.
 - Emit `deduplication.subject_merged` (§2.2) **after** the transaction commits.
 
+A pair proposed by several sources holds one candidate per `kind`; the merge settles them
+together. In the merge transaction every other `OPEN` candidate on the same unordered pair becomes
+`CONFIRMED` with the same decision, and a `DISMISSED` one stays dismissed. A `same` on a candidate
+whose pair already has a `CONFIRMED` sibling becomes `CONFIRMED` without a second merge when `keep`
+is the surviving subject and the other subject is deleted; a `keep` naming the deleted subject is
+refused with `deduplication.resolve.keep_contradicts_merge`.
+
 Review through Tasks Management stays available: `create_review_tasks(candidate_ids, actor)`
 creates one `tasks_management.Task` per candidate (`source="deduplication_candidate"`, `data` =
 candidate summary, `task` FK set); the existing `task_service.complete_task` binding gains a

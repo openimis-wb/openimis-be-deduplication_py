@@ -675,6 +675,24 @@ def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
     return kept
 
 
+def _pair_candidates(candidate: DuplicateCandidate):
+    """Every candidate on the same unordered pair, whatever its kind, the given one excluded."""
+    return DuplicateCandidate.objects.filter(
+        subject_model=candidate.subject_model, subject_a=candidate.subject_a, subject_b=candidate.subject_b,
+    ).exclude(pk=candidate.pk)
+
+
+def _confirm_open_siblings(candidate: DuplicateCandidate, *, actor, note: str):
+    """Settle the other OPEN kinds of a merged pair with the same decision; dismissed kinds stay."""
+    now = datetime.now()
+    for sibling in _pair_candidates(candidate).select_for_update().filter(status=DuplicateCandidate.Status.OPEN):
+        sibling.status = DuplicateCandidate.Status.CONFIRMED
+        sibling.reviewed_by = actor.username
+        sibling.reviewed_at = now
+        sibling.decision_note = note
+        sibling.save()
+
+
 def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None, actor, note: str = ""):
     """different -> DISMISSED. same -> merge_subjects then CONFIRMED.
 
@@ -683,6 +701,12 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
     stale decision never merges into a retired subject nor flips a merged pair.
     A "same" decision raises ValueError, leaving the candidate OPEN, when keep is
     not one of the pair's two subjects or when either subject is soft-deleted.
+
+    A merge confirms the pair once: the other OPEN candidates on the same pair are
+    CONFIRMED in the same transaction. A "same" on a candidate whose pair already has a
+    CONFIRMED sibling is CONFIRMED without a second merge when keep is the surviving
+    subject and the other one is deleted; a keep that contradicts the merge is refused
+    with deduplication.resolve.keep_contradicts_merge.
     """
     if decision not in ('same', 'different'):
         raise ValueError(f"unknown decision {decision!r}")
@@ -701,15 +725,23 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
             model = apps.get_model(candidate.subject_model)
             kept = model.objects.get(id=keep_id)
             retired = model.objects.get(id=retired_id)
-            if getattr(kept, 'is_deleted', False) or getattr(retired, 'is_deleted', False):
-                raise ValueError("deduplication.resolve.subject_deleted")
-            merge_subjects(kept, retired, actor)
+            kept_deleted = getattr(kept, 'is_deleted', False)
+            retired_deleted = getattr(retired, 'is_deleted', False)
+            pair_merged = _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists()
+            if pair_merged and kept_deleted and not retired_deleted:
+                raise ValueError("deduplication.resolve.keep_contradicts_merge")
+            if not (pair_merged and retired_deleted and not kept_deleted):
+                if kept_deleted or retired_deleted:
+                    raise ValueError("deduplication.resolve.subject_deleted")
+                merge_subjects(kept, retired, actor)
             candidate.status = DuplicateCandidate.Status.CONFIRMED
 
         candidate.reviewed_by = actor.username
         candidate.reviewed_at = datetime.now()
         candidate.decision_note = note
         candidate.save()
+        if candidate.status == DuplicateCandidate.Status.CONFIRMED:
+            _confirm_open_siblings(candidate, actor=actor, note=note)
     return candidate
 
 
