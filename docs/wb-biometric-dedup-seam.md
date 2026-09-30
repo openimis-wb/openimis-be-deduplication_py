@@ -311,8 +311,10 @@ higher score and merges evidence. Returns `(row, created)`.
 run_scan(*, kinds: list[str] | None = None, actor: str) -> dict   # counts per kind
 scan_subject(subject_model, subject_id) -> list[DuplicateCandidate]   # on-demand, all sources
 ```
-Management command `scan_duplicates [--kind KIND]`. `run_scan` reads `ScanState`, calls
-`source.scan(since)`, records, then stores `source.watermark()`.
+Management command `scan_duplicates [--kind KIND]`. `run_scan` reads `ScanState`, captures
+`source.watermark()`, calls `source.scan(since)`, records, then stores the captured watermark.
+A subject written while the scan iterates is newer than the captured cursor and is revisited by
+the next scan; `record_candidate` is idempotent, so the revisit is harmless.
 
 ```python
 resolve(candidate, *, decision: "same"|"different", keep: str | None = None, actor, note="")

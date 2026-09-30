@@ -1,9 +1,12 @@
+from unittest import mock
+
 from django.db import connection
 from django.test import TestCase
 
 from deduplication.models import DuplicateCandidate
 from deduplication.services import record_candidate, run_scan, scan_subject
-from deduplication.sources import Candidate
+from deduplication.sources import Candidate, CandidateSource, order_pair
+from deduplication.sources.subject import subject_watermark, touched_ids
 from deduplication.tests.data.dedup_candidates import individuals_data
 from deduplication.tests.helpers import LogInHelper
 from individual.models import Individual
@@ -66,6 +69,56 @@ class RunScanTest(TestCase):
 
         second = run_scan(kinds=["demographic"], actor=self.user)
         self.assertEqual(second.get("demographic", 0), 0)
+
+
+class _ConcurrentWriteSource(CandidateSource):
+    """Proposes one pair per touched subject; writes a new subject while its first scan iterates."""
+
+    kind = "probe"
+
+    def __init__(self, username):
+        self.username = username
+        self.written = None
+
+    def watermark(self):
+        return subject_watermark()
+
+    def scan(self, since):
+        touched = touched_ids(Individual, since)
+        ids = sorted(str(i) for i in Individual.objects.values_list("id", flat=True)
+                     if touched is None or str(i) in touched)
+        for subject_id in ids:
+            a, b = order_pair(subject_id, "zzz-partner")
+            yield Candidate(
+                subject_model="individual.Individual", subject_a=a, subject_b=b,
+                kind=self.kind, score=None, evidence={},
+            )
+            if self.written is None:
+                self.written = Individual(first_name="Late", last_name="Writer", dob="2001-02-03")
+                self.written.save(username=self.username)
+
+
+class RunScanConcurrentWriteTest(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+        Individual(first_name="Early", last_name="Bird", dob="1999-01-01").save(username=cls.user.username)
+
+    def test_subject_written_during_a_scan_is_seen_by_the_next_scan(self):
+        source = _ConcurrentWriteSource(self.user.username)
+        with mock.patch("deduplication.services.registered_sources", return_value=[source]):
+            run_scan(kinds=["probe"], actor=self.user)
+            self.assertIsNotNone(source.written)
+            late_id = str(source.written.id)
+
+            run_scan(kinds=["probe"], actor=self.user)
+
+        pairs = DuplicateCandidate.objects.filter(kind="probe")
+        self.assertTrue(
+            any(late_id in (c.subject_a, c.subject_b) for c in pairs),
+            "the subject written while the first scan iterated was never scanned",
+        )
 
 
 class ScanSubjectTest(TestCase):

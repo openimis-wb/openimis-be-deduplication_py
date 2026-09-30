@@ -531,12 +531,14 @@ def run_scan(*, kinds: Optional[List[str]] = None, actor) -> Dict[str, int]:
         if state.updated_at is not None or state.last_id:
             since = Watermark(updated_at=state.updated_at, last_id=state.last_id or None)
 
+        # Taken before scanning: a subject written while the scan iterates is newer than this
+        # cursor, so the next scan revisits it; record_candidate makes the revisit harmless.
+        new_watermark = source.watermark()
         count = 0
         for candidate in source.scan(since):
             record_candidate(candidate, source=type(source).__name__)
             count += 1
 
-        new_watermark = source.watermark()
         state.updated_at = new_watermark.updated_at
         state.last_id = new_watermark.last_id or ""
         state.last_scan_at = datetime.now()
