@@ -642,16 +642,62 @@ def _merge_field_values(kept, retired, actor) -> bool:
     return changed
 
 
+def _live_rows(app_label: str, model_name: str):
+    """Non-deleted rows of an optional model, or None when its app is not installed."""
+    try:
+        return apps.get_model(app_label, model_name).objects.filter(is_deleted=False)
+    except LookupError:
+        return None
+
+
+def _enrolment_blockers(retired) -> Dict[str, int]:
+    """
+    Live enrolment rows that keep a retired individual enrolled and payable, by kind:
+    its own Beneficiary rows, its GroupIndividual memberships, and the GroupBeneficiary
+    rows of the groups it belongs to. Other subject models hold none.
+    """
+    if type(retired)._meta.label != 'individual.Individual':
+        return {}
+
+    blockers = {}
+    beneficiaries = _live_rows('social_protection', 'Beneficiary')
+    if beneficiaries is not None:
+        blockers['beneficiary'] = beneficiaries.filter(individual_id=retired.id).count()
+
+    memberships = _live_rows('individual', 'GroupIndividual')
+    group_ids = []
+    if memberships is not None:
+        memberships = memberships.filter(individual_id=retired.id)
+        blockers['group_individual'] = memberships.count()
+        group_ids = list(memberships.values_list('group_id', flat=True))
+
+    group_beneficiaries = _live_rows('social_protection', 'GroupBeneficiary')
+    if group_beneficiaries is not None and group_ids:
+        blockers['group_beneficiary'] = group_beneficiaries.filter(group_id__in=group_ids).count()
+
+    return {kind: count for kind, count in blockers.items() if count}
+
+
 @transaction.atomic
 def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
     """
     Merge retired into kept: fill-empty + conflict journal on both policies, then
     soft-delete retired ("delete") or mark it retired_into kept before soft-deleting ("retire").
     Emits deduplication.subject_merged after the transaction commits.
+
+    Raises ValueError("deduplication.resolve.retired_subject_enrolled: ...") before any write
+    while retired still holds a live Beneficiary, GroupIndividual or GroupBeneficiary row.
     """
     policy = policy or DeduplicationConfig.merge_policy
     if policy not in ('delete', 'retire'):
         raise ValueError(f"unknown merge policy {policy!r}")
+
+    blockers = _enrolment_blockers(retired)
+    if blockers:
+        rows = ", ".join(f"{kind}={count}" for kind, count in blockers.items())
+        raise ValueError(
+            f"deduplication.resolve.retired_subject_enrolled: subject {retired.id} still holds live rows ({rows})"
+        )
 
     changed = _merge_field_values(kept, retired, actor)
     if changed:
@@ -700,7 +746,8 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
     candidate that is already CONFIRMED or DISMISSED is returned unchanged, so a
     stale decision never merges into a retired subject nor flips a merged pair.
     A "same" decision raises ValueError, leaving the candidate OPEN, when keep is
-    not one of the pair's two subjects or when either subject is soft-deleted.
+    not one of the pair's two subjects, when either subject is soft-deleted, or when
+    the subject to retire still holds enrolment rows (see merge_subjects).
 
     A merge confirms the pair once: the other OPEN candidates on the same pair are
     CONFIRMED in the same transaction. A "same" on a candidate whose pair already has a

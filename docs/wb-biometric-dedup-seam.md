@@ -322,6 +322,15 @@ resolve(candidate, *, decision: "same"|"different", keep: str | None = None, act
 `different` → `DISMISSED`. `same` → `CONFIRMED`, `keep` defaults to `subject_a`, then
 `merge_subjects(kept, retired, actor)`:
 
+- Precondition: the subject to retire holds no live enrolment row. While it still has a
+  non-deleted `social_protection.Beneficiary`, a non-deleted `individual.GroupIndividual`, or a
+  non-deleted `social_protection.GroupBeneficiary` on one of its groups, `resolve` and
+  `merge_subjects` raise `ValueError("deduplication.resolve.retired_subject_enrolled: …")` naming
+  the blocking rows by kind and count, before any write; the candidate stays `OPEN`. The rows are
+  removed first (soft delete), then the merge is retried. Payroll selects active beneficiaries
+  without reading the individual, so a soft-deleted individual with a live row stays payable.
+  The models are resolved by `apps.get_model`; an absent app blocks nothing. Rows on `kept` never
+  block.
 - `DEDUPLICATION["MERGE_POLICY"]`: `"delete"` (default, legacy) or `"retire"`.
 - Field policy on the subject model for both policies: an empty field on `kept` is filled from
   `retired`; a differing non-empty value is **kept and journaled** into
