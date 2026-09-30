@@ -3,7 +3,7 @@ from unittest import mock
 from django.db import connection
 from django.test import TestCase
 
-from deduplication.models import DuplicateCandidate
+from deduplication.models import DuplicateCandidate, ScanState
 from deduplication.services import record_candidate, run_scan, scan_subject
 from deduplication.sources import Candidate, CandidateSource, order_pair
 from deduplication.sources.subject import subject_watermark, touched_ids
@@ -189,3 +189,73 @@ class IdentifierEachScanKeepsEveryKeyTest(TestCase):
         a, b = order_pair(str(self.inds[0].id), str(self.inds[1].id))
         candidate = DuplicateCandidate.objects.get(subject_a=a, subject_b=b, kind="identifier")
         self.assertEqual(candidate.evidence["columns"], {"national_id": "kk-2", "phone": "677000100"})
+
+
+class _BrokenSource(CandidateSource):
+    """Fails with a database error part-way through its scan."""
+
+    kind = "broken"
+
+    def watermark(self):
+        return subject_watermark()
+
+    def scan(self, since):
+        yield Candidate(
+            subject_model="individual.Individual", subject_a="broken-a", subject_b="broken-b",
+            kind=self.kind, score=None, evidence={},
+        )
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM deduplication_no_such_table")
+
+
+class _PairSource(CandidateSource):
+    kind = "pairs"
+
+    def watermark(self):
+        return subject_watermark()
+
+    def scan(self, since):
+        yield Candidate(
+            subject_model="individual.Individual", subject_a="pair-a", subject_b="pair-b",
+            kind=self.kind, score=None, evidence={},
+        )
+
+
+class RunScanSourceIsolationTest(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+        Individual(first_name="Iso", last_name="Lated", dob="1980-01-01").save(username=cls.user.username)
+
+    def test_a_failing_source_is_reported_and_the_others_still_run(self):
+        with mock.patch("deduplication.services.registered_sources",
+                        return_value=[_BrokenSource(), _PairSource()]):
+            result = run_scan(actor=self.user)
+
+        self.assertEqual(result["pairs"], 1)
+        self.assertNotIn("broken", {k for k, v in result.items() if isinstance(v, int)})
+        self.assertIn("broken", result["failed"])
+        self.assertIn("deduplication_no_such_table", result["failed"]["broken"])
+        self.assertTrue(DuplicateCandidate.objects.filter(kind="pairs").exists())
+        self.assertFalse(DuplicateCandidate.objects.filter(kind="broken").exists())
+
+    def test_a_failing_source_does_not_advance_its_watermark(self):
+        ScanState.objects.create(kind="broken")
+        with mock.patch("deduplication.services.registered_sources",
+                        return_value=[_BrokenSource(), _PairSource()]):
+            run_scan(actor=self.user)
+
+        broken = ScanState.objects.get(kind="broken")
+        self.assertIsNone(broken.updated_at)
+        self.assertEqual(broken.last_id, "")
+        self.assertIsNone(broken.last_scan_at)
+        pairs = ScanState.objects.get(kind="pairs")
+        self.assertIsNotNone(pairs.updated_at)
+        self.assertIsNotNone(pairs.last_scan_at)
+
+    def test_a_scan_without_failure_reports_counts_only(self):
+        with mock.patch("deduplication.services.registered_sources", return_value=[_PairSource()]):
+            result = run_scan(actor=self.user)
+
+        self.assertEqual(result, {"pairs": 1})

@@ -320,6 +320,14 @@ Management command `scan_duplicates [--kind KIND]`. `run_scan` reads `ScanState`
 A subject written while the scan iterates is newer than the captured cursor and is revisited by
 the next scan; `record_candidate` is idempotent, so the revisit is harmless.
 
+Each source runs in its own transaction. A source that raises is logged, its candidates and its
+`ScanState` watermark are rolled back, and the other sources still run. The returned dict holds
+`{kind: count}` for the sources that completed and, only when a source failed,
+`"failed": {kind: error}`. `scan_duplicates` prints one line per source and exits non-zero
+(`CommandError`) when any source failed; `runDuplicateScan` records the mutation as failed with
+`deduplication.mutation.failed_to_run_scan` and the failed kinds in `detail`, after the other
+sources' candidates are recorded.
+
 ```python
 resolve(candidate, *, decision: "same"|"different", keep: str | None = None, actor, note="")
 ```

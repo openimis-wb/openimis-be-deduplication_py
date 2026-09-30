@@ -119,7 +119,13 @@ class RunDuplicateScanMutation(OpenIMISMutation):
             cls._validate(user, **data)
             data.pop('client_mutation_id', None)
             data.pop('client_mutation_label', None)
-            run_scan(kinds=data.get('kinds'), actor=user)
+            failed = run_scan(kinds=data.get('kinds'), actor=user).get('failed')
+            if failed:
+                return [
+                    {
+                        'message': "deduplication.mutation.failed_to_run_scan",
+                        'detail': "; ".join(f"{kind}: {error}" for kind, error in failed.items()),
+                    }]
             return None
         except Exception as exc:
             return [

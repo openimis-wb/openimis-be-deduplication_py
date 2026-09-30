@@ -1,10 +1,12 @@
 import json
+from unittest import mock
 
 from core.models import MutationLog
 from core.models.openimis_graphql_test_case import openIMISGraphQLTestCase, BaseTestContext
 from deduplication.models import DuplicateCandidate
 from deduplication.sources import order_pair
 from deduplication.tests.helpers import LogInHelper
+from deduplication.tests.test_candidates import _BrokenSource, _PairSource
 from individual.models import Individual
 
 
@@ -76,6 +78,25 @@ class DuplicateCandidateSchemaTest(openIMISGraphQLTestCase):
         )
         self.assertResponseNoErrors(response)
         self._assert_mutation_success("scan-1")
+
+    def test_run_duplicate_scan_mutation_fails_when_a_source_fails(self):
+        mutation = """
+        mutation RunDuplicateScan($input: RunDuplicateScanMutationInput!) {
+          runDuplicateScan(input: $input) { clientMutationId internalId }
+        }
+        """
+        with mock.patch("deduplication.services.registered_sources",
+                        return_value=[_BrokenSource(), _PairSource()]):
+            response = self.query(
+                mutation,
+                variables={"input": {"clientMutationId": "scan-broken"}},
+                headers={"HTTP_AUTHORIZATION": f"Bearer {self.user_token}"}
+            )
+        self.assertResponseNoErrors(response)
+        log = MutationLog.objects.get(client_mutation_id="scan-broken")
+        self.assertEqual(log.status, MutationLog.ERROR)
+        self.assertIn("broken", log.error)
+        self.assertTrue(DuplicateCandidate.objects.filter(kind="pairs").exists())
 
     def test_resolve_duplicate_candidate_mutation(self):
         mutation = """

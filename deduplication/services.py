@@ -530,31 +530,51 @@ def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, 
     return obj, False
 
 
-def run_scan(*, kinds: Optional[List[str]] = None, actor) -> Dict[str, int]:
-    """Scan registered sources (optionally filtered by kind), record candidates, advance watermarks."""
+def _scan_source(source) -> int:
+    """Scan one source, record its candidates and advance its watermark; returns the count."""
+    state, _created = ScanState.objects.get_or_create(kind=source.kind)
+    since = None
+    if state.updated_at is not None or state.last_id:
+        since = Watermark(updated_at=state.updated_at, last_id=state.last_id or None)
+
+    # Taken before scanning: a subject written while the scan iterates is newer than this
+    # cursor, so the next scan revisits it; record_candidate makes the revisit harmless.
+    new_watermark = source.watermark()
+    count = 0
+    for candidate in source.scan(since):
+        record_candidate(candidate, source=type(source).__name__)
+        count += 1
+
+    state.updated_at = new_watermark.updated_at
+    state.last_id = new_watermark.last_id or ""
+    state.last_scan_at = datetime.now()
+    state.summary = {'count': count}
+    state.save()
+    return count
+
+
+def run_scan(*, kinds: Optional[List[str]] = None, actor) -> Dict[str, Union[int, Dict[str, str]]]:
+    """
+    Scan registered sources (optionally filtered by kind), record candidates, advance watermarks.
+
+    Returns {kind: count} for the sources that completed. Each source runs in its own
+    transaction: a failing source is logged, its candidates and watermark are rolled back,
+    and the other sources still run. Failures are returned under "failed" as {kind: error};
+    the key is present only when a source failed.
+    """
     counts = {}
+    failed = {}
     for source in registered_sources():
         if kinds and source.kind not in kinds:
             continue
-        state, _created = ScanState.objects.get_or_create(kind=source.kind)
-        since = None
-        if state.updated_at is not None or state.last_id:
-            since = Watermark(updated_at=state.updated_at, last_id=state.last_id or None)
-
-        # Taken before scanning: a subject written while the scan iterates is newer than this
-        # cursor, so the next scan revisits it; record_candidate makes the revisit harmless.
-        new_watermark = source.watermark()
-        count = 0
-        for candidate in source.scan(since):
-            record_candidate(candidate, source=type(source).__name__)
-            count += 1
-
-        state.updated_at = new_watermark.updated_at
-        state.last_id = new_watermark.last_id or ""
-        state.last_scan_at = datetime.now()
-        state.summary = {'count': count}
-        state.save()
-        counts[source.kind] = count
+        try:
+            with transaction.atomic():
+                counts[source.kind] = _scan_source(source)
+        except Exception as exc:
+            logger.error("Duplicate scan of source %s failed", source.kind, exc_info=exc)
+            failed[source.kind] = str(exc)
+    if failed:
+        counts['failed'] = failed
     return counts
 
 

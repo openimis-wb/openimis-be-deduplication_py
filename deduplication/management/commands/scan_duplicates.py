@@ -27,5 +27,10 @@ class Command(BaseCommand):
             raise CommandError("No actor user found; pass --user or seed the system user.")
 
         counts = run_scan(kinds=options.get('kinds'), actor=actor)
+        failed = counts.pop('failed', {})
         for kind, count in counts.items():
             self.stdout.write(self.style.SUCCESS(f"{kind}: {count} candidate(s) recorded"))
+        for kind, error in failed.items():
+            self.stdout.write(self.style.ERROR(f"{kind}: scan failed ({error})"))
+        if failed:
+            raise CommandError(f"Scan failed for source(s): {', '.join(failed)}")
