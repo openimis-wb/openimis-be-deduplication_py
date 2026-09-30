@@ -7,8 +7,6 @@ import uuid
 
 class Migration(migrations.Migration):
 
-    initial = True
-
     dependencies = [
         ("tasks_management", "0010_add_search_all_perms_admin"),
         ("deduplication", "0001_add_beneficiary_deduplication_right_to_admin"),
