@@ -8,7 +8,7 @@ from deduplication.services import record_candidate, run_scan, scan_subject
 from deduplication.sources import Candidate, CandidateSource, order_pair
 from deduplication.sources.subject import subject_watermark, touched_ids
 from deduplication.tests.data.dedup_candidates import individuals_data
-from deduplication.tests.helpers import LogInHelper
+from deduplication.tests.helpers import LogInHelper, override_deduplication_config
 from individual.models import Individual
 
 
@@ -140,3 +140,52 @@ class ScanSubjectTest(TestCase):
         self.assertTrue(results)
         for candidate in results:
             self.assertIn(str(self.inds[0].id), (candidate.subject_a, candidate.subject_b))
+
+
+class RecordCandidateColumnsUnionTest(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+
+    def test_record_candidate_unions_matched_columns(self):
+        first = Candidate(
+            subject_model="individual.Individual", subject_a="e", subject_b="f",
+            kind="identifier", score=None, evidence={"columns": {"national_id": "ab-1"}, "note": "first"},
+        )
+        second = Candidate(
+            subject_model="individual.Individual", subject_a="e", subject_b="f",
+            kind="identifier", score=None, evidence={"columns": {"phone": "699"}, "note": "second"},
+        )
+        record_candidate(first, source="TestSource")
+        obj, created = record_candidate(second, source="TestSource")
+
+        self.assertFalse(created)
+        self.assertEqual(obj.evidence["columns"], {"national_id": "ab-1", "phone": "699"})
+        self.assertEqual(obj.evidence["note"], "second")
+        obj.refresh_from_db()
+        self.assertEqual(obj.evidence["columns"], {"national_id": "ab-1", "phone": "699"})
+
+
+class IdentifierEachScanKeepsEveryKeyTest(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.inds = []
+        for phone in ("677000100", "677000100"):
+            i = Individual(first_name="Two", last_name="Keys", dob="1970-01-01",
+                           json_ext={"national_id": "KK-2", "phone": phone})
+            i.save(username=cls.user.username)
+            cls.inds.append(i)
+
+    def test_a_pair_matched_on_two_keys_keeps_both_in_evidence(self):
+        if connection.vendor == 'microsoft':
+            self.skipTest("This test can only be executed for PSQL database")
+
+        with override_deduplication_config(identifier_keys=["national_id", "phone"], identifier_match="each"):
+            run_scan(kinds=["identifier"], actor=self.user)
+
+        a, b = order_pair(str(self.inds[0].id), str(self.inds[1].id))
+        candidate = DuplicateCandidate.objects.get(subject_a=a, subject_b=b, kind="identifier")
+        self.assertEqual(candidate.evidence["columns"], {"national_id": "kk-2", "phone": "677000100"})

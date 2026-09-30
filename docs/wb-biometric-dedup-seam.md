@@ -305,7 +305,9 @@ The existing beneficiary/payment summary queries and their task flow are **untou
 record_candidate(c: Candidate, *, source: str) -> tuple[DuplicateCandidate, bool]
 ```
 `get_or_create` on the unique key. A `DISMISSED` row is never reopened. An `OPEN` row keeps the
-higher score and merges evidence. Returns `(row, created)`.
+higher score and merges evidence: `evidence["columns"]` becomes the union of the recorded and
+the incoming columns, so a pair matched on several identifier keys keeps every matched key; on
+any other evidence key the incoming value wins. Returns `(row, created)`.
 
 ```python
 run_scan(*, kinds: list[str] | None = None, actor: str) -> dict   # counts per kind

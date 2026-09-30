@@ -495,6 +495,16 @@ DUPLICATE_CANDIDATE_TASK_SOURCE = "deduplication_candidate"
 OPEN_TASK_STATUSES = (Task.Status.RECEIVED, Task.Status.ACCEPTED)
 
 
+def _merge_evidence(current: dict, incoming: dict) -> dict:
+    """Shallow merge where incoming keys win, except `columns`, which is the union of both."""
+    merged = {**current, **incoming}
+    current_columns = current.get("columns")
+    incoming_columns = incoming.get("columns")
+    if isinstance(current_columns, dict) and isinstance(incoming_columns, dict):
+        merged["columns"] = {**current_columns, **incoming_columns}
+    return merged
+
+
 def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, bool]:
     """Get-or-create a DuplicateCandidate for c's unique key; never reopens a dismissed row."""
     subject_a, subject_b = order_pair(c.subject_a, c.subject_b)
@@ -511,7 +521,7 @@ def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, 
     if c.score is not None and (obj.score is None or c.score > obj.score):
         obj.score = c.score
         changed = True
-    merged_evidence = {**(obj.evidence or {}), **(c.evidence or {})}
+    merged_evidence = _merge_evidence(obj.evidence or {}, c.evidence or {})
     if merged_evidence != (obj.evidence or {}):
         obj.evidence = merged_evidence
         changed = True
