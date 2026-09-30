@@ -4,6 +4,7 @@ from unittest import mock
 from core.models import MutationLog
 from core.models.openimis_graphql_test_case import openIMISGraphQLTestCase, BaseTestContext
 from deduplication.models import DuplicateCandidate
+from deduplication.services import REFUSAL_MESSAGES
 from deduplication.sources import order_pair
 from deduplication.tests.helpers import LogInHelper
 from deduplication.tests.test_candidates import _BrokenSource, _PairSource
@@ -201,3 +202,46 @@ class DuplicateCandidateSchemaTest(openIMISGraphQLTestCase):
         self.assertEqual(self.candidate.status, DuplicateCandidate.Status.OPEN)
         self.b.refresh_from_db()
         self.assertFalse(self.b.is_deleted)
+
+    def _first_error(self, log):
+        errors = json.loads(log.error)
+        self.assertIsInstance(errors, list)
+        return errors[0]
+
+    def test_a_resolve_refusal_reaches_the_journal_as_a_readable_message_with_its_code(self):
+        self.a.delete(user=self.user)
+
+        log = self._resolve_same(str(self.a.id), "resolve-readable")
+
+        error = self._first_error(log)
+        self.assertEqual(error["code"], "deduplication.resolve.subject_deleted")
+        self.assertEqual(error["message"], REFUSAL_MESSAGES["deduplication.resolve.subject_deleted"])
+        self.assertFalse(error["message"].startswith("deduplication."))
+        self.assertIn("deduplication.resolve.subject_deleted", error["detail"])
+
+    def test_the_enrolment_refusal_keeps_its_row_counts_in_the_detail(self):
+        with mock.patch(
+            "deduplication.services._enrolment_blockers", return_value={"beneficiary": 2},
+        ):
+            log = self._resolve_same(str(self.a.id), "resolve-enrolled")
+
+        error = self._first_error(log)
+        self.assertEqual(error["code"], "deduplication.resolve.retired_subject_enrolled")
+        self.assertEqual(error["message"], REFUSAL_MESSAGES["deduplication.resolve.retired_subject_enrolled"])
+        self.assertIn("beneficiary=2", error["detail"])
+
+
+class RefusalMessagesTest(openIMISGraphQLTestCase):
+    def test_every_resolve_refusal_code_has_a_readable_message(self):
+        codes = {
+            "deduplication.resolve.keep_not_in_pair",
+            "deduplication.resolve.subject_deleted",
+            "deduplication.resolve.keep_contradicts_merge",
+            "deduplication.resolve.retired_subject_enrolled",
+            "deduplication.resolve.pair_already_merged",
+            "deduplication.resolve.decision_missing",
+        }
+        self.assertEqual(set(REFUSAL_MESSAGES), codes)
+        for code, message in REFUSAL_MESSAGES.items():
+            self.assertTrue(message.strip(), code)
+            self.assertNotIn("deduplication.", message, code)

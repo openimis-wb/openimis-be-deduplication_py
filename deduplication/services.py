@@ -494,6 +494,37 @@ def on_payment_benefit_deduplication_task_complete_service_handler(**kwargs):
 DUPLICATE_CANDIDATE_TASK_SOURCE = "deduplication_candidate"
 OPEN_TASK_STATUSES = (Task.Status.RECEIVED, Task.Status.ACCEPTED)
 
+# Reviewer-facing text of each refusal code. The mutation journal prints the message as is
+# (no translation), next to the code, so the text is plain English.
+REFUSAL_MESSAGES = {
+    "deduplication.resolve.keep_not_in_pair":
+        "The record to keep is not one of the two records of this pair.",
+    "deduplication.resolve.subject_deleted":
+        "One of the two records is already deleted; they can no longer be merged.",
+    "deduplication.resolve.keep_contradicts_merge":
+        "This pair was already merged under another detection, keeping the other record. "
+        "Keep that record to confirm this detection.",
+    "deduplication.resolve.retired_subject_enrolled":
+        "The record to retire is still a beneficiary or a group member. "
+        "Remove it from its benefit plans and groups first, then merge.",
+    "deduplication.resolve.pair_already_merged":
+        "This pair was already merged under another detection; it can no longer be dismissed.",
+    "deduplication.resolve.decision_missing":
+        "The approver who completed the task recorded no decision for this pair.",
+}
+
+
+class ResolveRefusal(ValueError):
+    """A resolve refused before any write; str() starts with the code, then optional details."""
+
+    def __init__(self, code: str, details: str = ""):
+        self.code = code
+        super().__init__(f"{code}: {details}" if details else code)
+
+    @property
+    def message(self) -> str:
+        return REFUSAL_MESSAGES.get(self.code, self.code)
+
 
 def _merge_evidence(current: dict, incoming: dict) -> dict:
     """Shallow merge where incoming keys win, except `columns`, which is the union of both."""
@@ -715,7 +746,7 @@ def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
     soft-delete retired ("delete") or mark it retired_into kept before soft-deleting ("retire").
     Emits deduplication.subject_merged after the transaction commits.
 
-    Raises ValueError("deduplication.resolve.retired_subject_enrolled: ...") before any write
+    Raises ResolveRefusal("deduplication.resolve.retired_subject_enrolled: ...") before any write
     while retired still holds a live Beneficiary, GroupIndividual or GroupBeneficiary row.
     """
     policy = policy or DeduplicationConfig.merge_policy
@@ -725,8 +756,9 @@ def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
     blockers = _enrolment_blockers(retired)
     if blockers:
         rows = ", ".join(f"{kind}={count}" for kind, count in blockers.items())
-        raise ValueError(
-            f"deduplication.resolve.retired_subject_enrolled: subject {retired.id} still holds live rows ({rows})"
+        raise ResolveRefusal(
+            "deduplication.resolve.retired_subject_enrolled",
+            f"subject {retired.id} still holds live rows ({rows})",
         )
 
     changed = _merge_field_values(kept, retired, actor)
@@ -808,12 +840,12 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
             return candidate
         if decision == 'different':
             if _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists():
-                raise ValueError("deduplication.resolve.pair_already_merged")
+                raise ResolveRefusal("deduplication.resolve.pair_already_merged")
             candidate.status = DuplicateCandidate.Status.DISMISSED
         else:
             keep_id = str(keep) if keep else candidate.subject_a
             if keep_id not in (candidate.subject_a, candidate.subject_b):
-                raise ValueError("deduplication.resolve.keep_not_in_pair")
+                raise ResolveRefusal("deduplication.resolve.keep_not_in_pair")
             retired_id = candidate.subject_b if keep_id == candidate.subject_a else candidate.subject_a
             model = apps.get_model(candidate.subject_model)
             kept = model.objects.get(id=keep_id)
@@ -822,10 +854,10 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
             retired_deleted = getattr(retired, 'is_deleted', False)
             pair_merged = _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists()
             if pair_merged and kept_deleted and not retired_deleted:
-                raise ValueError("deduplication.resolve.keep_contradicts_merge")
+                raise ResolveRefusal("deduplication.resolve.keep_contradicts_merge")
             if not (pair_merged and retired_deleted and not kept_deleted):
                 if kept_deleted or retired_deleted:
-                    raise ValueError("deduplication.resolve.subject_deleted")
+                    raise ResolveRefusal("deduplication.resolve.subject_deleted")
                 merge_subjects(kept, retired, actor)
             candidate.status = DuplicateCandidate.Status.CONFIRMED
 
@@ -902,7 +934,7 @@ def resolve_candidate_of_completing_task(sender, instance, **kwargs):
         additional_resolve_data = (instance.json_ext or {}).get('additional_resolve_data') or {}
         resolve_data = additional_resolve_data.get(str(instance.user_updated_id))
         if not isinstance(resolve_data, dict) or not resolve_data.get('decision'):
-            raise ValueError("deduplication.resolve.decision_missing")
+            raise ResolveRefusal("deduplication.resolve.decision_missing")
         resolve(
             candidate,
             decision=resolve_data.get('decision'),

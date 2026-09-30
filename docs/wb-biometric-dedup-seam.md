@@ -342,7 +342,7 @@ other, and the second sees the first one's merge.
 - Precondition: the subject to retire holds no live enrolment row. While it still has a
   non-deleted `social_protection.Beneficiary`, a non-deleted `individual.GroupIndividual`, or a
   non-deleted `social_protection.GroupBeneficiary` on one of its groups, `resolve` and
-  `merge_subjects` raise `ValueError("deduplication.resolve.retired_subject_enrolled: …")` naming
+  `merge_subjects` raise a `ResolveRefusal` reading `deduplication.resolve.retired_subject_enrolled: …`, naming
   the blocking rows by kind and count, before any write; the candidate stays `OPEN`. The rows are
   removed first (soft delete), then the merge is retried. Payroll selects active beneficiaries
   without reading the individual, so a soft-deleted individual with a live row stays payable.
@@ -395,6 +395,15 @@ style the module already uses. Mutations `runDuplicateScan(kinds)`,
 Rights: `gql_resolve_duplicate_perms=["172003"]`, `gql_run_scan_perms=["172004"]`,
 `gql_query_duplicates_perms=["172005"]` via module configuration; review-task creation keeps
 `172001`.
+
+Every refusal of `resolve` is a `ResolveRefusal` (a `ValueError`) carrying its code:
+`deduplication.resolve.keep_not_in_pair`, `subject_deleted`, `keep_contradicts_merge`,
+`retired_subject_enrolled`, `pair_already_merged` and `decision_missing` (task bridge only);
+`str()` starts with the code. `resolveDuplicateCandidate` records a refusal in the mutation log
+as `{"message": <readable English text>, "code": <code>, "detail": <code and details>}`. The
+openIMIS journal prints `[code] message` and shows `detail` when expanded; it translates
+neither, and no backend module ships compiled message catalogues, so the message is English.
+Screens that read the mutation log themselves translate the `code`.
 
 ### 4.5 Tests
 registry and `order_pair`; demographic source on fixture individuals (json_ext column);

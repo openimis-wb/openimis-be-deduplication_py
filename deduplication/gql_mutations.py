@@ -8,6 +8,7 @@ from deduplication.models import DuplicateCandidate
 from deduplication.services import (
     CreateDeduplicationReviewTasksService,
     CreateDeduplicationPaymentReviewTasksService,
+    ResolveRefusal,
     create_review_tasks,
     resolve,
     run_scan,
@@ -171,6 +172,9 @@ class ResolveDuplicateCandidateMutation(OpenIMISMutation):
                 note=data.get('note', ''),
             )
             return None
+        except ResolveRefusal as refusal:
+            # The journal prints "[code] message" with the detail below it.
+            return [{'message': refusal.message, 'code': refusal.code, 'detail': str(refusal)}]
         except Exception as exc:
             return [
                 {
