@@ -15,8 +15,10 @@ from deduplication.gql_queries import (
     DeduplicationSummaryGQLType,
     DeduplicationSummaryRowGQLType,
     DuplicateCandidateGQLType,
+    DuplicateCandidateResolveCheckGQLType,
 )
 from deduplication.models import DuplicateCandidate
+from deduplication.services import ResolveRefusal, check_resolve
 
 
 class Query(graphene.ObjectType):
@@ -28,6 +30,14 @@ class Query(graphene.ObjectType):
         status=graphene.String(),
         kind=graphene.String(),
         subjectId=graphene.String(),
+    )
+
+    duplicate_candidate_resolve_check = graphene.Field(
+        DuplicateCandidateResolveCheckGQLType,
+        candidate_id=graphene.UUID(required=True),
+        decision=graphene.String(required=True),
+        keep=graphene.String(required=False),
+        description="Runs the checks resolveDuplicateCandidate would run for this decision, and writes nothing.",
     )
 
     beneficiary_deduplication_summary = graphene.Field(
@@ -106,6 +116,18 @@ class Query(graphene.ObjectType):
             filters.append(Q(subject_a=subject_id) | Q(subject_b=subject_id))
 
         return DuplicateCandidate.objects.filter(*filters)
+
+    def resolve_duplicate_candidate_resolve_check(self, info, candidate_id, decision, keep=None, **kwargs):
+        Query._check_permissions(info.context.user, DeduplicationConfig.gql_query_duplicates_perms)
+
+        if decision not in ('same', 'different'):
+            raise ValueError("deduplication.mutation.invalid_decision")
+        candidate = DuplicateCandidate.objects.get(id=candidate_id)
+        try:
+            check_resolve(candidate, decision=decision, keep=keep)
+        except ResolveRefusal as refusal:
+            return DuplicateCandidateResolveCheckGQLType(ok=False, code=refusal.code, message=refusal.message)
+        return DuplicateCandidateResolveCheckGQLType(ok=True)
 
     @staticmethod
     def _check_permissions(user, perms):

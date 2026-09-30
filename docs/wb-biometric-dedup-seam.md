@@ -366,6 +366,18 @@ refused with `deduplication.resolve.keep_contradicts_merge`. A `different` on a 
 pair already has a `CONFIRMED` sibling is refused with `deduplication.resolve.pair_already_merged`;
 the candidate stays `OPEN`.
 
+```python
+check_resolve(candidate, *, decision, keep=None) -> None   # raises ResolveRefusal, writes nothing
+```
+`check_resolve` is the read-only twin of `resolve`. It raises the `ResolveRefusal` that `resolve`
+would raise for the same decision and returns `None` when `resolve` would accept it. It reads the
+pair, the subjects and their siblings and takes no lock, so a concurrent `resolve` can still change
+the outcome; `resolve` re-checks under its locks. Both call `plan_resolve` for the checks on the
+pair (`keep_not_in_pair`, `keep_contradicts_merge`, `subject_deleted`, `pair_already_merged`, and
+the sibling-confirmed pass-through, which plans no merge), and the enrolment guard of
+`merge_subjects` (`retired_subject_enrolled`), so the two cannot drift. A candidate that is no
+longer `OPEN` needs no decision and is never refused. An unknown `decision` raises `ValueError`.
+
 Review through Tasks Management stays available: `create_review_tasks(candidate_ids, actor)`
 creates one `tasks_management.Task` per candidate (`source="deduplication_candidate"`, `data` =
 candidate summary, `task` FK set). A `pre_save` receiver on `tasks_management.Task` bridges the
@@ -385,12 +397,21 @@ task's `user_updated`. The receiver runs inside `TaskService.complete_task`'s tr
 
 On the `resolveTask` path, tasks_management's `on_task_resolve` calls `complete_task` and
 discards its result, so the reviewer's `resolveTask` mutation still reports success; the task
-stays open and the refusal is in the server log.
+stays open and the refusal is in the server log. The approver therefore learns the refusal before
+submitting: the task form calls `duplicateCandidateResolveCheck` (§4.4) whenever the decision or the
+kept record changes, shows the translated refusal and disables the approve button while the check
+refuses.
 
 ### 4.4 GraphQL — graphene 2 (existing fields kept)
 
 Query `duplicateCandidates(status, kind, subjectId, first, offset)` following the connection
-style the module already uses. Mutations `runDuplicateScan(kinds)`,
+style the module already uses. Query `duplicateCandidateResolveCheck(candidateId, decision, keep)`
+returns `{ ok, code, message }` by running `check_resolve` and writes nothing: `ok` is false with the
+refusal's `deduplication.resolve.<reason>` code and English message when `resolveDuplicateCandidate`
+would refuse the decision, and true (`code` and `message` null) otherwise, including for a candidate
+that is no longer `OPEN`. It needs `gql_query_duplicates_perms`, like the candidate queries; a
+caller without it gets the `Unauthorized` GraphQL error and no result. An unknown `decision` or a
+missing candidate is a GraphQL error. Mutations `runDuplicateScan(kinds)`,
 `resolveDuplicateCandidate(id, decision, keep, note)`, `createDuplicateReviewTasks(ids)`.
 Rights: `gql_resolve_duplicate_perms=["172003"]`, `gql_run_scan_perms=["172004"]`,
 `gql_query_duplicates_perms=["172005"]` via module configuration; review-task creation keeps

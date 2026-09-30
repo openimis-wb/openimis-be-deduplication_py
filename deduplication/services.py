@@ -1,5 +1,6 @@
 import copy
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Union, Tuple, Type
 from datetime import datetime
@@ -739,6 +740,17 @@ def _enrolment_blockers(retired) -> Dict[str, int]:
     return {kind: count for kind, count in blockers.items() if count}
 
 
+def _require_retired_not_enrolled(retired):
+    """ResolveRefusal("deduplication.resolve.retired_subject_enrolled") while retired holds live enrolment rows."""
+    blockers = _enrolment_blockers(retired)
+    if blockers:
+        rows = ", ".join(f"{kind}={count}" for kind, count in blockers.items())
+        raise ResolveRefusal(
+            "deduplication.resolve.retired_subject_enrolled",
+            f"subject {retired.id} still holds live rows ({rows})",
+        )
+
+
 @transaction.atomic
 def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
     """
@@ -753,13 +765,7 @@ def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
     if policy not in ('delete', 'retire'):
         raise ValueError(f"unknown merge policy {policy!r}")
 
-    blockers = _enrolment_blockers(retired)
-    if blockers:
-        rows = ", ".join(f"{kind}={count}" for kind, count in blockers.items())
-        raise ResolveRefusal(
-            "deduplication.resolve.retired_subject_enrolled",
-            f"subject {retired.id} still holds live rows ({rows})",
-        )
+    _require_retired_not_enrolled(retired)
 
     changed = _merge_field_values(kept, retired, actor)
     if changed:
@@ -811,6 +817,68 @@ def _lock_subjects(subject_model: str, subject_ids):
         list(manager.select_for_update().filter(pk=subject_id).values_list('pk', flat=True))
 
 
+@dataclass(frozen=True)
+class ResolvePlan:
+    """What an accepted decision does: merge `retired` into `kept`, or nothing to merge."""
+
+    kept: Optional[models.Model] = None
+    retired: Optional[models.Model] = None
+    merge: bool = False
+
+
+def _validate_decision(decision: str):
+    if decision not in ('same', 'different'):
+        raise ValueError(f"unknown decision {decision!r}")
+
+
+def plan_resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None) -> ResolvePlan:
+    """
+    The preconditions of a decision on an OPEN candidate that read the pair and its siblings,
+    shared by resolve() and check_resolve() so the two cannot drift. Writes nothing.
+    Raises ResolveRefusal with keep_not_in_pair, keep_contradicts_merge, subject_deleted or,
+    for "different", pair_already_merged. A "same" on a pair another kind already merged,
+    keeping the surviving subject, plans no merge.
+    """
+    _validate_decision(decision)
+    if decision == 'different':
+        if _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists():
+            raise ResolveRefusal("deduplication.resolve.pair_already_merged")
+        return ResolvePlan()
+
+    keep_id = str(keep) if keep else candidate.subject_a
+    if keep_id not in (candidate.subject_a, candidate.subject_b):
+        raise ResolveRefusal("deduplication.resolve.keep_not_in_pair")
+    retired_id = candidate.subject_b if keep_id == candidate.subject_a else candidate.subject_a
+    model = apps.get_model(candidate.subject_model)
+    kept = model.objects.get(id=keep_id)
+    retired = model.objects.get(id=retired_id)
+    kept_deleted = getattr(kept, 'is_deleted', False)
+    retired_deleted = getattr(retired, 'is_deleted', False)
+    pair_merged = _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists()
+    if pair_merged and kept_deleted and not retired_deleted:
+        raise ResolveRefusal("deduplication.resolve.keep_contradicts_merge")
+    if pair_merged and retired_deleted and not kept_deleted:
+        return ResolvePlan(kept=kept, retired=retired)
+    if kept_deleted or retired_deleted:
+        raise ResolveRefusal("deduplication.resolve.subject_deleted")
+    return ResolvePlan(kept=kept, retired=retired, merge=True)
+
+
+def check_resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None) -> None:
+    """
+    Read-only twin of resolve(): raises the ResolveRefusal that resolve() would raise for this
+    decision, and returns None when resolve() would accept it. Takes no lock and writes nothing,
+    so a concurrent resolve can still change the outcome. A candidate that is no longer OPEN
+    needs no decision and is never refused.
+    """
+    _validate_decision(decision)
+    if candidate.status != DuplicateCandidate.Status.OPEN:
+        return
+    plan = plan_resolve(candidate, decision=decision, keep=keep)
+    if plan.merge:
+        _require_retired_not_enrolled(plan.retired)
+
+
 def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None, actor, note: str = ""):
     """different -> DISMISSED. same -> merge_subjects then CONFIRMED.
 
@@ -830,36 +898,19 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
     pair already has a CONFIRMED sibling is refused with
     deduplication.resolve.pair_already_merged, leaving the candidate OPEN.
     """
-    if decision not in ('same', 'different'):
-        raise ValueError(f"unknown decision {decision!r}")
+    _validate_decision(decision)
 
     with transaction.atomic():
         _lock_subjects(candidate.subject_model, (candidate.subject_a, candidate.subject_b))
         candidate = DuplicateCandidate.objects.select_for_update().get(pk=candidate.pk)
         if candidate.status != DuplicateCandidate.Status.OPEN:
             return candidate
-        if decision == 'different':
-            if _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists():
-                raise ResolveRefusal("deduplication.resolve.pair_already_merged")
-            candidate.status = DuplicateCandidate.Status.DISMISSED
-        else:
-            keep_id = str(keep) if keep else candidate.subject_a
-            if keep_id not in (candidate.subject_a, candidate.subject_b):
-                raise ResolveRefusal("deduplication.resolve.keep_not_in_pair")
-            retired_id = candidate.subject_b if keep_id == candidate.subject_a else candidate.subject_a
-            model = apps.get_model(candidate.subject_model)
-            kept = model.objects.get(id=keep_id)
-            retired = model.objects.get(id=retired_id)
-            kept_deleted = getattr(kept, 'is_deleted', False)
-            retired_deleted = getattr(retired, 'is_deleted', False)
-            pair_merged = _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists()
-            if pair_merged and kept_deleted and not retired_deleted:
-                raise ResolveRefusal("deduplication.resolve.keep_contradicts_merge")
-            if not (pair_merged and retired_deleted and not kept_deleted):
-                if kept_deleted or retired_deleted:
-                    raise ResolveRefusal("deduplication.resolve.subject_deleted")
-                merge_subjects(kept, retired, actor)
-            candidate.status = DuplicateCandidate.Status.CONFIRMED
+        plan = plan_resolve(candidate, decision=decision, keep=keep)
+        if plan.merge:
+            merge_subjects(plan.kept, plan.retired, actor)
+        candidate.status = (
+            DuplicateCandidate.Status.CONFIRMED if decision == 'same' else DuplicateCandidate.Status.DISMISSED
+        )
 
         candidate.reviewed_by = actor.username
         candidate.reviewed_at = datetime.now()

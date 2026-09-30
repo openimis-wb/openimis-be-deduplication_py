@@ -18,6 +18,14 @@ class DeduplicationSummaryGQLType(graphene.ObjectType):
     rows = graphene.List(DeduplicationSummaryRowGQLType)
 
 
+class DuplicateCandidateResolveCheckGQLType(graphene.ObjectType):
+    """Whether resolve() would accept a decision; code and message name the refusal when it would not."""
+
+    ok = graphene.Boolean(required=True)
+    code = graphene.String(description="deduplication.resolve.<reason> of the refusal; null when ok.")
+    message = graphene.String(description="Readable English text of the refusal; null when ok.")
+
+
 class DuplicateCandidateGQLType(DjangoObjectType):
     class Meta:
         model = DuplicateCandidate
