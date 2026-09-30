@@ -1,4 +1,5 @@
 from django.test import TestCase
+from core.test_helpers import create_test_interactive_user
 
 from deduplication.models import DuplicateCandidate
 from deduplication.services import create_review_tasks, resolve
@@ -193,3 +194,104 @@ class TaskBridgeTest(TestCase):
         self.assertEqual(candidate.status, DuplicateCandidate.Status.OPEN)
         b.refresh_from_db()
         self.assertFalse(b.is_deleted)
+
+
+class TaskBridgeApproverAndRollbackTest(TestCase):
+    """The completing approver's decision is applied inside the completion's transaction."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+        first = create_test_interactive_user(username="DedupApproverOne", password="DedupApprover1!")
+        second = create_test_interactive_user(username="DedupApproverTwo", password="DedupApprover2!")
+        # jsonb returns keys sorted; the completing approver sorts last so that reading
+        # the first stored entry picks the other approver's decision.
+        cls.other_approver, cls.completing_approver = sorted((first, second), key=lambda u: str(u.id))
+
+    def _make_pair(self):
+        a = Individual(first_name="A", last_name="One", dob="1990-01-01")
+        a.save(username=self.user.username)
+        b = Individual(first_name="B", last_name="Two", dob="1990-01-01")
+        b.save(username=self.user.username)
+        subject_a, subject_b = order_pair(str(a.id), str(b.id))
+        candidate = DuplicateCandidate.objects.create(
+            subject_model="individual.Individual", subject_a=subject_a, subject_b=subject_b,
+            kind="demographic", source="TestSource", evidence={},
+        )
+        create_review_tasks([candidate.id], self.user)
+        candidate.refresh_from_db()
+        return a, b, candidate
+
+    def _resolve_as(self, user, task_id, additional_data):
+        result = TaskService(user).resolve_task({
+            'id': task_id, 'business_status': {}, 'additional_data': additional_data,
+        })
+        self.assertTrue(result['success'], result)
+
+    def test_the_completing_approvers_decision_is_applied(self):
+        a, b, candidate = self._make_pair()
+        self._resolve_as(self.other_approver, candidate.task_id, {'decision': 'different', 'note': 'other'})
+        self._resolve_as(self.completing_approver, candidate.task_id,
+                         {'decision': 'same', 'keep': str(a.id), 'note': 'completing'})
+
+        result = TaskService(self.completing_approver).complete_task({'id': candidate.task_id})
+
+        self.assertTrue(result['success'], result)
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.CONFIRMED)
+        self.assertEqual(candidate.decision_note, "completing")
+        self.assertEqual(candidate.reviewed_by, self.completing_approver.username)
+        b.refresh_from_db()
+        self.assertTrue(b.is_deleted)
+
+    def test_a_completing_approver_without_a_decision_is_refused_while_the_candidate_is_open(self):
+        a, b, candidate = self._make_pair()
+        self._resolve_as(self.other_approver, candidate.task_id, {'decision': 'same', 'keep': str(a.id)})
+
+        result = TaskService(self.completing_approver).complete_task({'id': candidate.task_id})
+
+        self.assertFalse(result['success'])
+        self.assertIn("deduplication.resolve.decision_missing", result['detail'])
+        self.assertNotEqual(Task.objects.get(id=candidate.task_id).status, Task.Status.COMPLETED)
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.OPEN)
+        b.refresh_from_db()
+        self.assertFalse(b.is_deleted)
+
+    def test_a_task_whose_candidate_was_resolved_elsewhere_completes_without_a_decision(self):
+        a, b, candidate = self._make_pair()
+        resolve(candidate, decision="different", actor=self.user, note="on the page")
+
+        result = TaskService(self.completing_approver).complete_task({'id': candidate.task_id})
+
+        self.assertTrue(result['success'], result)
+        self.assertEqual(Task.objects.get(id=candidate.task_id).status, Task.Status.COMPLETED)
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.DISMISSED)
+        self.assertEqual(candidate.decision_note, "on the page")
+
+    def test_a_refused_resolve_rolls_the_completion_back_and_a_retry_succeeds(self):
+        a, b, candidate = self._make_pair()
+        a.delete(user=self.user)
+        self._resolve_as(self.completing_approver, candidate.task_id,
+                         {'decision': 'same', 'keep': str(a.id), 'note': 'retry me'})
+
+        refused = TaskService(self.completing_approver).complete_task({'id': candidate.task_id})
+
+        self.assertFalse(refused['success'])
+        self.assertIn("deduplication.resolve.subject_deleted", refused['detail'])
+        self.assertNotEqual(Task.objects.get(id=candidate.task_id).status, Task.Status.COMPLETED)
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.OPEN)
+
+        Individual.objects.filter(id=a.id).update(is_deleted=False)
+        retried = TaskService(self.completing_approver).complete_task({'id': candidate.task_id})
+
+        self.assertTrue(retried['success'], retried)
+        self.assertEqual(Task.objects.get(id=candidate.task_id).status, Task.Status.COMPLETED)
+        candidate.refresh_from_db()
+        self.assertEqual(candidate.status, DuplicateCandidate.Status.CONFIRMED)
+        self.assertEqual(candidate.decision_note, "retry me")
+        b.refresh_from_db()
+        self.assertTrue(b.is_deleted)

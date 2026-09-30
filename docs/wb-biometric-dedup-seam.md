@@ -360,9 +360,24 @@ the candidate stays `OPEN`.
 
 Review through Tasks Management stays available: `create_review_tasks(candidate_ids, actor)`
 creates one `tasks_management.Task` per candidate (`source="deduplication_candidate"`, `data` =
-candidate summary, `task` FK set); the existing `task_service.complete_task` binding gains a
-branch: when the completed task's source is `deduplication_candidate`, call `resolve()` with the
-decision read from `task.json_ext["additional_resolve_data"]` (`{"decision", "keep", "note"}`).
+candidate summary, `task` FK set). A `pre_save` receiver on `tasks_management.Task` bridges the
+completion: when a `deduplication_candidate` task moves to `COMPLETED` and its candidate is
+`OPEN`, it calls `resolve()` with the decision of the approver whose action completes the task,
+`task.json_ext["additional_resolve_data"][<id of that user>]` (`{"decision", "keep", "note"}`).
+Task resolution stores one entry per approver, keyed by user id, and the completing user is the
+task's `user_updated`. The receiver runs inside `TaskService.complete_task`'s transaction:
+
+- a refusal (any `deduplication.resolve.*` code, or `deduplication.resolve.decision_missing` when
+  the completing approver recorded no decision) rolls the completion back; the task keeps its
+  previous status, the candidate stays `OPEN`, `complete_task` returns `success: False` with the
+  refusal in `detail`, and the refusal is logged with the task and candidate ids. The approvers'
+  resolve data stays on the task, so completing again once the cause is removed applies it;
+- a candidate that is no longer `OPEN` (resolved from the candidate page) needs no decision, and
+  the task completes.
+
+On the `resolveTask` path, tasks_management's `on_task_resolve` calls `complete_task` and
+discards its result, so the reviewer's `resolveTask` mutation still reports success; the task
+stays open and the refusal is in the server log.
 
 ### 4.4 GraphQL — graphene 2 (existing fields kept)
 

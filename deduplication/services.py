@@ -857,36 +857,42 @@ def create_review_tasks(candidate_ids, actor) -> dict:
         return output_exception(model_name='DuplicateCandidate', method="create_review_tasks", exception=exc)
 
 
-def on_duplicate_candidate_task_complete_service_handler(**kwargs):
-    """Bridge: a completed deduplication_candidate task resolves its candidate with the reviewer's decision."""
+def resolve_candidate_of_completing_task(sender, instance, **kwargs):
+    """
+    pre_save receiver of tasks_management.Task. When a deduplication_candidate task moves to
+    COMPLETED, resolves its OPEN candidate with the decision of the approver whose action
+    completes it: json_ext["additional_resolve_data"][<user_updated id>]. It runs inside
+    TaskService.complete_task's transaction, so a refusal rolls the completion back and
+    complete_task returns the refusal in its detail. A candidate that is no longer OPEN
+    needs no decision and the task completes.
+    """
+    if instance.source != DUPLICATE_CANDIDATE_TASK_SOURCE or instance.status != Task.Status.COMPLETED:
+        return
+    if instance.get_dirty_fields().get('status', instance.status) == Task.Status.COMPLETED:
+        return
+
+    candidate_id = (instance.data or {}).get('id')
+    if not candidate_id:
+        return
+    candidate = DuplicateCandidate.objects.filter(id=candidate_id).first()
+    if candidate is None or candidate.status != DuplicateCandidate.Status.OPEN:
+        return
+
     try:
-        result = kwargs.get('result', {})
-        if not result or not result.get('success'):
-            return
-        task = result['data']['task']
-        if task.get('source') != DUPLICATE_CANDIDATE_TASK_SOURCE:
-            return
-        if task.get('status') != Task.Status.COMPLETED:
-            return
-
-        candidate_id = (task.get('data') or {}).get('id')
-        if not candidate_id:
-            return
-        additional_resolve_data = (task.get('json_ext') or {}).get('additional_resolve_data', {})
-        if not additional_resolve_data:
-            return
-        resolve_data = next(iter(additional_resolve_data.values()))
-
-        user_id = result['data']['user']['id']
-        actor = User.objects.get(id=user_id)
-        candidate = DuplicateCandidate.objects.get(id=candidate_id)
+        additional_resolve_data = (instance.json_ext or {}).get('additional_resolve_data') or {}
+        resolve_data = additional_resolve_data.get(str(instance.user_updated_id))
+        if not isinstance(resolve_data, dict) or not resolve_data.get('decision'):
+            raise ValueError("deduplication.resolve.decision_missing")
         resolve(
             candidate,
             decision=resolve_data.get('decision'),
             keep=resolve_data.get('keep'),
-            actor=actor,
+            actor=instance.user_updated,
             note=resolve_data.get('note', ''),
         )
-    except Exception as e:
-        logger.error("Error while executing on_duplicate_candidate_task_complete", exc_info=e)
-        return [str(e)]
+    except Exception as exc:
+        logger.error(
+            "Task %s not completed: duplicate candidate %s was not resolved (%s)",
+            instance.id, candidate_id, exc,
+        )
+        raise

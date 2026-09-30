@@ -35,6 +35,7 @@ class DeduplicationConfig(AppConfig):
         cfg = ModuleConfiguration.get_or_default(self.name, DEFAULT_CONFIG)
         self.__load_config(cfg)
         self.__register_builtin_sources()
+        self.__connect_task_bridge()
 
     @classmethod
     def __load_config(cls, cfg):
@@ -53,3 +54,14 @@ class DeduplicationConfig(AppConfig):
 
         register(DemographicSource())
         register(IdentifierSource())
+
+    @classmethod
+    def __connect_task_bridge(cls):
+        from django.db.models.signals import pre_save
+        from deduplication.services import resolve_candidate_of_completing_task
+
+        pre_save.connect(
+            resolve_candidate_of_completing_task,
+            sender='tasks_management.Task',
+            dispatch_uid='deduplication.resolve_candidate_of_completing_task',
+        )
