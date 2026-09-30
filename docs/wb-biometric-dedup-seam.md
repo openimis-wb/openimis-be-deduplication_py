@@ -280,7 +280,9 @@ guard, tombstone); registry per modality; legacy `get_active_provider` unchanged
 `DEDUPLICATION["DEMOGRAPHIC_COLUMNS"]` (default `["first_name", "last_name", "dob"]`; a name
 not on the model is read as a `json_ext` key, reusing the column-resolution logic already in
 `services.py:346-364`). Each group of n>1 yields all pairs, `score=None`,
-`evidence={"columns": {...values...}}`. Watermark on `date_updated`/id of the subject model.
+`evidence={"columns": {...values...}}`. A row whose value on any configured column is NULL (a
+NULL model column, or a `json_ext` key that is missing or null) belongs to no group. Watermark on
+`date_updated`/id of the subject model.
 
 `IdentifierSource`: exact match on `DEDUPLICATION["IDENTIFIER_KEYS"]` (json_ext keys, default
 `[]`), normalised (strip, casefold). Same shape.

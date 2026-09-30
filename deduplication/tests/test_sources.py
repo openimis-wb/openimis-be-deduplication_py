@@ -167,3 +167,37 @@ class IdentifierSourceAllModeTest(TestCase):
 
         touched_ids = {c.subject_a for c in candidates} | {c.subject_b for c in candidates}
         self.assertNotIn(str(self.inds[2].id), touched_ids)
+
+
+class DemographicSourceNullGroupingTest(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+        rows = [
+            {},                              # key missing
+            {},                              # key missing
+            {'village_code': None},          # key present, JSON null
+            {'village_code': 'V-12'},
+            {'village_code': 'V-12'},
+        ]
+        cls.inds = []
+        for json_ext in rows:
+            i = Individual(first_name='Nullgroup', last_name='Probe', dob='1977-07-07', json_ext=json_ext)
+            i.save(username=cls.user.username)
+            cls.inds.append(i)
+
+    def test_rows_missing_a_grouping_value_never_form_a_group(self):
+        if connection.vendor == 'microsoft':
+            self.skipTest("This test can only be executed for PSQL database")
+
+        with override_deduplication_config(demographic_columns=["first_name", "village_code"]):
+            candidates = list(DemographicSource().scan(None))
+
+        pairs = {(c.subject_a, c.subject_b) for c in candidates}
+        without_value = {str(i.id) for i in self.inds[:3]}
+        self.assertFalse(
+            [p for p in pairs if set(p) & without_value],
+            "subjects without a village_code were grouped together",
+        )
+        self.assertIn(order_pair(str(self.inds[3].id), str(self.inds[4].id)), pairs)

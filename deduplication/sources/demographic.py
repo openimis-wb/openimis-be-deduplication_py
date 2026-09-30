@@ -42,6 +42,10 @@ class DemographicSource(CandidateSource):
             queryset = queryset.annotate(**annotations)
 
         values = db_columns + json_keys
+        # GROUP BY treats NULLs as equal: a row without a value on any grouping column
+        # (NULL column, missing or null json_ext key) stays out of every group.
+        for value in values:
+            queryset = queryset.filter(**{f"{value}__isnull": False})
         queryset = queryset.values(*values).annotate(
             _count=Count("id"), _ids=ArrayAgg("id", distinct=True)
         ).filter(_count__gt=1).order_by()
