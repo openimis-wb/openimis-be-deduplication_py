@@ -749,9 +749,20 @@ def _confirm_open_siblings(candidate: DuplicateCandidate, *, actor, note: str):
         sibling.save()
 
 
+def _lock_subjects(subject_model: str, subject_ids):
+    """
+    Row-lock the subjects one at a time in sorted id order. Every resolve takes these locks
+    before its candidate row, so two resolves sharing a subject serialise without deadlock.
+    """
+    manager = apps.get_model(subject_model)._base_manager
+    for subject_id in sorted(set(subject_ids)):
+        list(manager.select_for_update().filter(pk=subject_id).values_list('pk', flat=True))
+
+
 def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None, actor, note: str = ""):
     """different -> DISMISSED. same -> merge_subjects then CONFIRMED.
 
+    Both subject rows are locked first, in sorted id order, then the candidate row.
     Only an OPEN candidate is resolved. The row is re-read under a row lock, and a
     candidate that is already CONFIRMED or DISMISSED is returned unchanged, so a
     stale decision never merges into a retired subject nor flips a merged pair.
@@ -771,6 +782,7 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
         raise ValueError(f"unknown decision {decision!r}")
 
     with transaction.atomic():
+        _lock_subjects(candidate.subject_model, (candidate.subject_a, candidate.subject_b))
         candidate = DuplicateCandidate.objects.select_for_update().get(pk=candidate.pk)
         if candidate.status != DuplicateCandidate.Status.OPEN:
             return candidate

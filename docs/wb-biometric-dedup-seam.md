@@ -323,6 +323,11 @@ the next scan; `record_candidate` is idempotent, so the revisit is harmless.
 ```python
 resolve(candidate, *, decision: "same"|"different", keep: str | None = None, actor, note="")
 ```
+`resolve` runs in one transaction that first locks both subject rows (`SELECT … FOR UPDATE`,
+one row at a time, in sorted id order), then the candidate row, before any check. Two resolves
+sharing a subject, such as (A,B) and (A,C) with opposite keeps, therefore run one after the
+other, and the second sees the first one's merge.
+
 `different` → `DISMISSED`. `same` → `CONFIRMED`, `keep` defaults to `subject_a`, then
 `merge_subjects(kept, retired, actor)`:
 

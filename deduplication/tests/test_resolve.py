@@ -1,6 +1,8 @@
 from unittest import mock
 
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from deduplication.models import DuplicateCandidate
 from deduplication.services import merge_subjects, resolve
@@ -267,3 +269,63 @@ class ResolveSameSubjectsAcrossKindsTest(TestCase):
 
         other.refresh_from_db()
         self.assertEqual(other.status, DuplicateCandidate.Status.DISMISSED)
+
+
+class ResolveLocksSubjectsTest(TestCase):
+    """Both subject rows are locked, in sorted id order, before the candidate row and any check."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+
+    def _pair(self):
+        a = Individual(first_name="Lock", last_name="One", dob="1990-01-01")
+        a.save(username=self.user.username)
+        b = Individual(first_name="Lock", last_name="Two", dob="1990-01-01")
+        b.save(username=self.user.username)
+        low, high = order_pair(str(a.id), str(b.id))
+        candidate = DuplicateCandidate.objects.create(
+            subject_model="individual.Individual", subject_a=low, subject_b=high,
+            kind="demographic", source="TestSource", evidence={},
+        )
+        return low, high, candidate
+
+    def _locks(self, queries):
+        subject_table = Individual._meta.db_table
+        candidate_table = DuplicateCandidate._meta.db_table
+        locks = []
+        for query in queries:
+            sql = query["sql"]
+            if "FOR UPDATE" not in sql:
+                continue
+            if f'FROM "{subject_table}"' in sql:
+                locks.append(("subject", sql))
+            elif f'FROM "{candidate_table}"' in sql:
+                locks.append(("candidate", sql))
+        return locks
+
+    def _assert_subjects_locked_first_in_order(self, low, high, queries):
+        locks = self._locks(queries)
+        self.assertGreaterEqual(len(locks), 3, locks)
+        self.assertEqual([kind for kind, _sql in locks[:3]], ["subject", "subject", "candidate"])
+        self.assertIn(low, locks[0][1])
+        self.assertIn(high, locks[1][1])
+        statements = [q["sql"] for q in queries if not q["sql"].startswith(("SAVEPOINT", "RELEASE SAVEPOINT"))]
+        self.assertIn("FOR UPDATE", statements[0], "a query ran before the first subject lock")
+
+    def test_same_locks_both_subjects_in_sorted_order_first(self):
+        low, high, candidate = self._pair()
+
+        with CaptureQueriesContext(connection) as ctx:
+            resolve(candidate, decision="same", keep=high, actor=self.user)
+
+        self._assert_subjects_locked_first_in_order(low, high, ctx.captured_queries)
+
+    def test_different_locks_both_subjects_in_sorted_order_first(self):
+        low, high, candidate = self._pair()
+
+        with CaptureQueriesContext(connection) as ctx:
+            resolve(candidate, decision="different", actor=self.user)
+
+        self._assert_subjects_locked_first_in_order(low, high, ctx.captured_queries)
