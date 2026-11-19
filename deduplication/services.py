@@ -1,5 +1,6 @@
 import copy
 import logging
+import re
 from functools import lru_cache
 from typing import List, Union, Tuple, Type
 from datetime import datetime
@@ -341,6 +342,27 @@ def get_duplication_benefit_aggregation(
     queryset = queryset.values(*values).annotate(id_count=Count('id'), ids=ArrayAgg('id', distinct=True)).filter(
         id_count__gt=1).order_by()
     return queryset
+
+
+_JSON_EXT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def validate_deduplication_columns(columns: List[str], *models) -> None:
+    """
+    Raises ValueError unless every column is a simple identifier without `__`
+    and, on each given model that defines a field of that name, a concrete,
+    non-relational field. Any other identifier is read as a json_ext key.
+    """
+    for column in columns:
+        if not isinstance(column, str) or "__" in column or not _JSON_EXT_KEY.fullmatch(column):
+            raise ValueError(f"Column '{column}' cannot be used for deduplication.")
+        for model in models:
+            try:
+                field = model._meta.get_field(column)
+            except FieldDoesNotExist:
+                continue
+            if field.is_relation or not field.concrete:
+                raise ValueError(f"Column '{column}' cannot be used for deduplication.")
 
 
 def _resolve_columns(model: Union[Type[ExtendableModel], Type[HistoryModel]], columns: List[str]) -> Tuple[

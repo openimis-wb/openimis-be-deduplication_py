@@ -1,2 +1,3 @@
 # flake8: noqa
 from deduplication.tests.test_dedup_beneficiary import DedupBeneficiaryTestCase
+from deduplication.tests.test_dedup_columns import DeduplicationColumnsTestCase

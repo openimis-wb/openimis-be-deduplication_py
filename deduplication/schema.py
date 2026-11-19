@@ -22,12 +22,15 @@ class Query(graphene.ObjectType):
 
     def resolve_beneficiary_deduplication_summary(self, info, columns=None, benefit_plan_id=None, **kwargs):
         from social_protection.apps import SocialProtectionConfig
-        from deduplication.services import get_beneficiary_duplication_aggregation
+        from social_protection.models import Beneficiary
+        from deduplication.services import get_beneficiary_duplication_aggregation, validate_deduplication_columns
 
         Query._check_permissions(info.context.user, SocialProtectionConfig.gql_beneficiary_search_perms)
 
         if not columns:
             return ["deduplication.validation.no_columns_provided"]
+
+        validate_deduplication_columns(columns, Beneficiary)
 
         individual_columns = ['first_name', 'last_name', 'dob']
         columns = [f'individual__{column}' if column in individual_columns else column for column in columns]
@@ -46,13 +49,19 @@ class Query(graphene.ObjectType):
 
     def resolve_benefit_deduplication_summary(self, info, columns=None, payment_cycle_id=None, **kwargs):
         from social_protection.apps import SocialProtectionConfig
-        from deduplication.services import get_benefit_consumption_duplication_aggregation
+        from individual.models import Individual
+        from payroll.models import BenefitConsumption
+        from deduplication.services import (
+            get_benefit_consumption_duplication_aggregation, validate_deduplication_columns,
+        )
 
         # Check permissions
         Query._check_permissions(info.context.user, SocialProtectionConfig.gql_beneficiary_search_perms)
 
         if not columns:
             return ["deduplication.validation.no_columns_provided"]
+
+        validate_deduplication_columns(columns, Individual, BenefitConsumption)
 
         # Add prefix to individual columns
         individual_columns = ['first_name', 'last_name', 'dob']
