@@ -428,6 +428,24 @@ class DeduplicationResolutionScopeTestCase(DeduplicationScopeFixture):
         self.assertEqual(task.status, Task.Status.ACCEPTED)
         self._assert_no_beneficiary_deleted()
 
+    def test_resolution_completing_on_a_refused_stored_entry_leaves_the_task_open(self):
+        """
+        tasks_management swallows the completion refusal inside resolve_task: the
+        resolution itself succeeds, the task stays open and nothing is merged.
+        """
+        task = self._beneficiary_task(self.admin, self.beneficiaries["A"] + self.beneficiaries["B"])
+        task.json_ext = {"additional_resolve_data": {str(self.admin.id): {
+            "beneficiaryIds": [str(b.id) for b in self.beneficiaries["B"]], "values": {},
+        }}}
+        task.save(user=self.admin)
+
+        result = self._resolve(task, None)
+
+        self.assertTrue(result["success"], result)
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.ACCEPTED)
+        self._assert_no_beneficiary_deleted()
+
     def test_merge_and_removal_refuse_ids_outside_the_task_or_the_user_districts(self):
         from deduplication.services import merge_duplicate_beneficiaries, remove_duplicate_benefit_payments
         beneficiary_task = {
