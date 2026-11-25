@@ -1,4 +1,5 @@
 import json
+import uuid
 
 from django.db.models import Q
 from django.core.exceptions import ValidationError
@@ -7,6 +8,39 @@ from django.utils.translation import gettext as _
 from social_protection.models import Beneficiary
 from payroll.models import BenefitConsumption
 from tasks_management.models import Task
+
+
+def normalise_ids(ids):
+    """
+    Canonical (lowercase, hyphenated) form of each record id, duplicates dropped.
+    Raises ValidationError on an id that is not a UUID.
+    """
+    normalised = []
+    for value in ids or []:
+        try:
+            canonical = str(uuid.UUID(str(value)))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError(f"Invalid record id: {json.dumps(str(value))}")
+        if canonical not in normalised:
+            normalised.append(canonical)
+    return normalised
+
+
+def ids_in_open_tasks(service_name):
+    """Canonical ids held by the open (accepted or received) tasks of a source, whatever form they were stored in."""
+    open_tasks = Task.objects.filter(
+        Q(is_deleted=False),
+        Q(status=Task.Status.ACCEPTED) | Q(status=Task.Status.RECEIVED),
+        Q(source=service_name),
+    )
+    held = set()
+    for task_ids in open_tasks.values_list('data__ids', flat=True):
+        for value in task_ids if isinstance(task_ids, list) else []:
+            try:
+                held.add(str(uuid.UUID(str(value))))
+            except (ValueError, TypeError, AttributeError):
+                continue
+    return held
 
 
 class CreateDeduplicationReviewTasksValidation:
@@ -19,7 +53,7 @@ class CreateDeduplicationReviewTasksValidation:
     @classmethod
     def get_errors_deduplication_task_data(cls, task_data, service_name):
         count = task_data.get("count")
-        ids = task_data.get("ids")
+        ids = normalise_ids(task_data.get("ids"))
         column_values = task_data.get("column_values")
 
         errors = [
@@ -77,19 +111,10 @@ class CreateDeduplicationReviewTasksValidation:
     @classmethod
     def _validate_beneficiary_already_in_task(cls, ids, service_name):
         beneficiary_in_task = {}
-        status_accepted = Task.Status.ACCEPTED
-        status_received = Task.Status.RECEIVED
-
-        filters = [
-            Q(is_deleted=False),
-            Q(status=status_accepted) | Q(status=status_received),
-            Q(source=service_name),
-        ]
-        task_queryset = Task.objects.filter(*filters)
+        held = ids_in_open_tasks(service_name)
 
         for beneficiary_id in ids:
-            tmp_task_queryset = task_queryset
-            if tmp_task_queryset.filter(data__ids__contains=beneficiary_id).exists():
+            if beneficiary_id in held:
                 beneficiary = Beneficiary.objects.get(id=beneficiary_id)
                 beneficiary_in_task[beneficiary_id] = beneficiary.individual.__str__()
 
@@ -106,7 +131,7 @@ class CreateDeduplicationPaymentReviewTasksValidation:
     @classmethod
     def get_errors_deduplication_task_data(cls, task_data, service_name):
         count = task_data.get("count")
-        ids = task_data.get("ids")
+        ids = normalise_ids(task_data.get("ids"))
         column_values = task_data.get("column_values")
 
         errors = [
@@ -164,19 +189,10 @@ class CreateDeduplicationPaymentReviewTasksValidation:
     @classmethod
     def _validate_benefits_already_in_task(cls, ids, service_name):
         benefit_in_task = {}
-        status_accepted = Task.Status.ACCEPTED
-        status_received = Task.Status.RECEIVED
-
-        filters = [
-            Q(is_deleted=False),
-            Q(status=status_accepted) | Q(status=status_received),
-            Q(source=service_name),
-        ]
-        task_queryset = Task.objects.filter(*filters)
+        held = ids_in_open_tasks(service_name)
 
         for benefit_id in ids:
-            tmp_task_queryset = task_queryset
-            if tmp_task_queryset.filter(data__ids__contains=benefit_id).exists():
+            if benefit_id in held:
                 benefit = BenefitConsumption.objects.get(id=benefit_id)
                 benefit_in_task[benefit_id] = benefit.individual.__str__()
 

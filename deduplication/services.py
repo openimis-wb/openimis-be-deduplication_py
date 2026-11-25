@@ -19,7 +19,7 @@ from core.models import ExtendableModel, HistoryModel, User, HistoryBusinessMode
 from core.services.utils import model_representation, output_exception
 from core.utils import to_json_safe_value
 from deduplication.validations import CreateDeduplicationReviewTasksValidation, \
-    CreateDeduplicationPaymentReviewTasksValidation
+    CreateDeduplicationPaymentReviewTasksValidation, normalise_ids
 from individual.models import Individual
 from invoice.models import Bill, BillItem
 from payroll.models import BenefitConsumption, BenefitConsumptionStatus, \
@@ -44,7 +44,8 @@ class CreateDeduplicationReviewTasksService:
             tasks = []
 
             for task_data in summary:
-                refuse_beneficiaries_out_of_scope(task_data.get('ids') or [], self.user)
+                task_data['ids'] = normalise_ids(task_data.get('ids'))
+                refuse_beneficiaries_out_of_scope(task_data['ids'], self.user)
             for task_data in summary:
                 self.validation_class.validate_create_deduplication_task(task_data, self.get_class_name())
                 create_task_data = {
@@ -127,7 +128,7 @@ class CreateDeduplicationReviewTasksService:
             else:
                 return to_json_safe_value(value)
 
-        refuse_beneficiaries_out_of_scope(data.get('ids') or [], self.user)
+        refuse_beneficiaries_out_of_scope(data.get('ids'), self.user)
         serialized_data = copy.deepcopy(data)
         beneficiary_id = serialized_data['ids'][0]
         benefit_plan = BenefitPlan.objects.filter(beneficiary__id=beneficiary_id).first()
@@ -162,7 +163,8 @@ class CreateDeduplicationPaymentReviewTasksService:
             tasks = []
             payment_cycle = PaymentCycle.objects.get(id=payment_cycle_id)
             for task_data in summary:
-                refuse_benefits_out_of_scope(task_data.get('ids') or [], self.user)
+                task_data['ids'] = normalise_ids(task_data.get('ids'))
+                refuse_benefits_out_of_scope(task_data['ids'], self.user)
             for task_data in summary:
                 self.validation_class.validate_create_deduplication_task(task_data, self.get_class_name())
                 create_task_data = {
@@ -258,7 +260,7 @@ class CreateDeduplicationPaymentReviewTasksService:
                 return benefits_list
             else:
                 return to_json_safe_value(value)
-        refuse_benefits_out_of_scope(data.get('ids') or [], self.user)
+        refuse_benefits_out_of_scope(data.get('ids'), self.user)
         serialized_data = copy.deepcopy(data)
         for key, value in data.items():
             serialized_data[key] = serializer(key, value)
@@ -292,14 +294,15 @@ def benefits_in_scope(user, queryset=None):
 
 def _refuse_out_of_scope(model, ids, scoped_queryset, message):
     """
-    Raises PermissionDenied when an id names an existing row the user cannot see.
-    Ids of rows that no longer exist are left to the caller.
+    Raises PermissionDenied when an id names an existing row the user cannot see,
+    and ValidationError when an id is not a UUID. Ids of rows that no longer
+    exist are left to the caller.
     """
-    existing = {str(pk) for pk in model.objects.filter(id__in=ids).values_list('id', flat=True)}
-    visible = {str(pk) for pk in scoped_queryset.filter(id__in=ids).values_list('id', flat=True)}
-    out_of_scope = [str(i) for i in ids if str(i) in existing and str(i) not in visible]
-    if out_of_scope:
-        raise PermissionDenied(f"{message}: {json.dumps(out_of_scope)}")
+    ids = normalise_ids(ids)
+    refused = model.objects.filter(id__in=ids).exclude(id__in=scoped_queryset.values('id'))
+    refused_ids = {str(pk) for pk in refused.values_list('id', flat=True)}
+    if refused_ids:
+        raise PermissionDenied(f"{message}: {json.dumps([i for i in ids if i in refused_ids])}")
 
 
 def refuse_beneficiaries_out_of_scope(ids, user):
@@ -314,6 +317,29 @@ def refuse_benefits_out_of_scope(ids, user):
         BenefitConsumption, ids, benefits_in_scope(user),
         "Payments outside the districts of your account cannot be reviewed",
     )
+
+
+def _refuse_ids_outside_task(task_ids, submitted_ids, message):
+    task_ids = set(normalise_ids(task_ids))
+    outside = [i for i in normalise_ids(submitted_ids) if i not in task_ids]
+    if outside:
+        raise PermissionDenied(f"{message}: {json.dumps(outside)}")
+
+
+def refuse_beneficiary_resolution(task_ids, submitted_ids, user):
+    """Refuses a merge selection that leaves the task's rows or the user's districts."""
+    _refuse_ids_outside_task(
+        task_ids, submitted_ids, "Beneficiaries that are not part of this review task cannot be merged",
+    )
+    refuse_beneficiaries_out_of_scope(submitted_ids, user)
+
+
+def refuse_benefit_resolution(task_ids, submitted_ids, user):
+    """Refuses a removal selection that leaves the task's rows or the user's districts."""
+    _refuse_ids_outside_task(
+        task_ids, submitted_ids, "Payments that are not part of this review task cannot be removed",
+    )
+    refuse_benefits_out_of_scope(submitted_ids, user)
 
 
 def get_beneficiary_duplication_aggregation(columns: List[str], benefit_plan_id: str, user):
@@ -480,7 +506,8 @@ def merge_duplicate_beneficiaries(task_data, user_id):
     additional_resolve_data = task_data.get("json_ext", {}).get("additional_resolve_data", {})
     merge_data = list(additional_resolve_data.values())[0]
     field_values = merge_data.get('values', {})
-    beneficiary_ids = merge_data.get("beneficiaryIds", [])
+    beneficiary_ids = normalise_ids(merge_data.get("beneficiaryIds", []))
+    refuse_beneficiary_resolution((task_data.get("data") or {}).get("ids"), beneficiary_ids, user)
 
     oldest_record_beneficiary = Beneficiary.objects.filter(id__in=beneficiary_ids).order_by('date_created').first()
     if oldest_record_beneficiary is None:
@@ -525,11 +552,13 @@ def on_deduplication_task_complete_service_handler(**kwargs):
 
 
 @transaction.atomic
-def remove_duplicate_benefit_payments(task_data):
+def remove_duplicate_benefit_payments(task_data, user_id):
+    user = User.objects.get(id=user_id)
     # additional_resolve_data is a key in task__json_ext that stores data selected by user during resolving a task
     additional_resolve_data = task_data.get("json_ext", {}).get("additional_resolve_data", {})
     merge_data = list(additional_resolve_data.values())[0]
-    benefit_ids = merge_data.get("benefitIds", [])
+    benefit_ids = normalise_ids(merge_data.get("benefitIds", []))
+    refuse_benefit_resolution((task_data.get("data") or {}).get("ids"), benefit_ids, user)
     benefits_to_delete = BenefitConsumption.objects.filter(id__in=benefit_ids)\
         .values_list('id', 'benefitattachment__bill')
     if len(benefits_to_delete) > 0:
@@ -560,9 +589,61 @@ def on_payment_benefit_deduplication_task_complete_service_handler(**kwargs):
         result = kwargs.get('result', {})
         task = result['data']['task']
         source = result['data']['task']["source"]
+        user_id = result['data']['user']["id"]
         if (result and result['success'] and task['status'] == Task.Status.COMPLETED
                 and source == CreateDeduplicationPaymentReviewTasksService.get_class_name()):
-            remove_duplicate_benefit_payments(task)
+            remove_duplicate_benefit_payments(task, user_id)
     except Exception as e:
         logger.error("Error while executing on_task_complete", exc_info=e)
         return [str(e)]
+
+
+def _service_call_payload(kwargs):
+    """The obj_data a TaskService method was called with, from its service-signal arguments."""
+    args, call_kwargs = kwargs.get('data') or [(), {}]
+    if args:
+        return args[0] or {}
+    return call_kwargs.get('obj_data') or {}
+
+
+def _refuse_task_resolution(task, resolve_data, user):
+    checks = {
+        CreateDeduplicationReviewTasksService.get_class_name(): ('beneficiaryIds', refuse_beneficiary_resolution),
+        CreateDeduplicationPaymentReviewTasksService.get_class_name(): ('benefitIds', refuse_benefit_resolution),
+    }
+    if task.source not in checks:
+        return
+    key, refuse = checks[task.source]
+    if isinstance(resolve_data, str):
+        resolve_data = json.loads(resolve_data or '{}')
+    refuse((task.data or {}).get('ids'), (resolve_data or {}).get(key) or [], user)
+
+
+def on_deduplication_task_resolve_check(**kwargs):
+    """
+    Before TaskService.resolve_task: refuses resolution data of a deduplication
+    task that names rows outside the task or outside the resolving user's
+    districts. The raise stops the resolution, so nothing is stored.
+    """
+    obj_data = _service_call_payload(kwargs)
+    task = Task.objects.filter(id=obj_data.get('id')).first()
+    if task is not None:
+        _refuse_task_resolution(task, obj_data.get('additional_data'), kwargs['cls_'].user)
+
+
+def on_deduplication_task_complete_check(**kwargs):
+    """
+    Before TaskService.complete_task: checks the resolution data the completion
+    handlers apply against the task's rows and the completing user's districts.
+    The raise stops the completion, so the task stays open.
+    """
+    obj_data = _service_call_payload(kwargs)
+    if obj_data.get('failed', False):
+        return
+    task = Task.objects.filter(id=obj_data.get('id')).first()
+    if task is None:
+        return
+    additional_resolve_data = (task.json_ext or {}).get('additional_resolve_data') or {}
+    applied = next(iter(additional_resolve_data.values()), None)
+    if applied:
+        _refuse_task_resolution(task, applied, kwargs['cls_'].user)
