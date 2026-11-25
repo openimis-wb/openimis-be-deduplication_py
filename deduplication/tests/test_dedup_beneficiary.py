@@ -41,7 +41,7 @@ class DedupBeneficiaryTestCase(TestCase):
         if connection.vendor == 'microsoft':
             self.skipTest("This test can only be executed for PSQL database")
         else:
-            res = get_beneficiary_duplication_aggregation(['individual__first_name', 'k1'], self.bp.id)
+            res = get_beneficiary_duplication_aggregation(['individual__first_name', 'k1'], self.bp.id, self.user)
             listed = list(res)
             self.assertEqual(len(listed), 1)
             response = listed[0]

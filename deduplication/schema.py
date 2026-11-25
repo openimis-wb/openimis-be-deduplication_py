@@ -34,7 +34,8 @@ class Query(graphene.ObjectType):
 
         individual_columns = ['first_name', 'last_name', 'dob']
         columns = [f'individual__{column}' if column in individual_columns else column for column in columns]
-        aggr = get_beneficiary_duplication_aggregation(columns=columns, benefit_plan_id=benefit_plan_id)
+        aggr = get_beneficiary_duplication_aggregation(
+            columns=columns, benefit_plan_id=benefit_plan_id, user=info.context.user)
         rows = list()
         for row in aggr:
             individual_columns = [f'individual__{column}' for column in individual_columns]
@@ -68,7 +69,8 @@ class Query(graphene.ObjectType):
         columns = [f'{column}' if column in individual_columns else column for column in columns]
 
         # Fetch the aggregation data
-        aggr = get_benefit_consumption_duplication_aggregation(columns=columns, payment_cycle_id=payment_cycle_id)
+        aggr = get_benefit_consumption_duplication_aggregation(
+            columns=columns, payment_cycle_id=payment_cycle_id, user=info.context.user)
         rows = []
         for row in aggr:
             count = row.pop('id_count')

@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import re
 from functools import lru_cache
@@ -6,7 +7,7 @@ from typing import List, Union, Tuple, Type
 from datetime import datetime
 
 from django.contrib.postgres.aggregates import ArrayAgg
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist, PermissionDenied
 from django.db import models
 from django.db.models import Count, Q
 from django.db.models.fields.json import KeyTextTransform
@@ -42,6 +43,8 @@ class CreateDeduplicationReviewTasksService:
             task_service = TaskService(self.user)
             tasks = []
 
+            for task_data in summary:
+                refuse_beneficiaries_out_of_scope(task_data.get('ids') or [], self.user)
             for task_data in summary:
                 self.validation_class.validate_create_deduplication_task(task_data, self.get_class_name())
                 create_task_data = {
@@ -124,6 +127,7 @@ class CreateDeduplicationReviewTasksService:
             else:
                 return to_json_safe_value(value)
 
+        refuse_beneficiaries_out_of_scope(data.get('ids') or [], self.user)
         serialized_data = copy.deepcopy(data)
         beneficiary_id = serialized_data['ids'][0]
         benefit_plan = BenefitPlan.objects.filter(beneficiary__id=beneficiary_id).first()
@@ -157,6 +161,8 @@ class CreateDeduplicationPaymentReviewTasksService:
             task_service = TaskService(self.user)
             tasks = []
             payment_cycle = PaymentCycle.objects.get(id=payment_cycle_id)
+            for task_data in summary:
+                refuse_benefits_out_of_scope(task_data.get('ids') or [], self.user)
             for task_data in summary:
                 self.validation_class.validate_create_deduplication_task(task_data, self.get_class_name())
                 create_task_data = {
@@ -252,6 +258,7 @@ class CreateDeduplicationPaymentReviewTasksService:
                 return benefits_list
             else:
                 return to_json_safe_value(value)
+        refuse_benefits_out_of_scope(data.get('ids') or [], self.user)
         serialized_data = copy.deepcopy(data)
         for key, value in data.items():
             serialized_data[key] = serializer(key, value)
@@ -271,7 +278,45 @@ class CreateDeduplicationPaymentReviewTasksService:
         return fields_to_exclude
 
 
-def get_beneficiary_duplication_aggregation(columns: List[str] = None, benefit_plan_id: str = None):
+def beneficiaries_in_scope(user, queryset=None):
+    """Beneficiaries visible to the user under row security (districts of the account)."""
+    return Beneficiary.get_queryset(queryset if queryset is not None else Beneficiary.objects.all(), user)
+
+
+def benefits_in_scope(user, queryset=None):
+    """Benefit consumptions whose individual is visible to the user under row security."""
+    if queryset is None:
+        queryset = BenefitConsumption.objects.all()
+    return queryset.filter(individual__in=Individual.get_queryset(None, user))
+
+
+def _refuse_out_of_scope(model, ids, scoped_queryset, message):
+    """
+    Raises PermissionDenied when an id names an existing row the user cannot see.
+    Ids of rows that no longer exist are left to the caller.
+    """
+    existing = {str(pk) for pk in model.objects.filter(id__in=ids).values_list('id', flat=True)}
+    visible = {str(pk) for pk in scoped_queryset.filter(id__in=ids).values_list('id', flat=True)}
+    out_of_scope = [str(i) for i in ids if str(i) in existing and str(i) not in visible]
+    if out_of_scope:
+        raise PermissionDenied(f"{message}: {json.dumps(out_of_scope)}")
+
+
+def refuse_beneficiaries_out_of_scope(ids, user):
+    _refuse_out_of_scope(
+        Beneficiary, ids, beneficiaries_in_scope(user),
+        "Beneficiaries outside the districts of your account cannot be reviewed",
+    )
+
+
+def refuse_benefits_out_of_scope(ids, user):
+    _refuse_out_of_scope(
+        BenefitConsumption, ids, benefits_in_scope(user),
+        "Payments outside the districts of your account cannot be reviewed",
+    )
+
+
+def get_beneficiary_duplication_aggregation(columns: List[str], benefit_plan_id: str, user):
     if not columns:
         raise ValueError("At least one column required")
     if not benefit_plan_id:
@@ -280,10 +325,13 @@ def get_beneficiary_duplication_aggregation(columns: List[str] = None, benefit_p
     db_columns, json_keys = _resolve_columns(Beneficiary, columns)
     filters = [Q(benefit_plan_id=benefit_plan_id), Q(is_deleted=False)]
 
-    return get_duplication_aggregation(Beneficiary, columns=db_columns, json_ext_keys=json_keys, filters=filters)
+    return get_duplication_aggregation(
+        Beneficiary, columns=db_columns, json_ext_keys=json_keys, filters=filters,
+        queryset=beneficiaries_in_scope(user),
+    )
 
 
-def get_benefit_consumption_duplication_aggregation(columns: List[str] = None, payment_cycle_id: str = None):
+def get_benefit_consumption_duplication_aggregation(columns: List[str], payment_cycle_id: str, user):
     if not columns:
         raise ValueError("At least one column required")
     if not payment_cycle_id:
@@ -301,12 +349,15 @@ def get_benefit_consumption_duplication_aggregation(columns: List[str] = None, p
         Q(status=BenefitConsumptionStatus.ACCEPTED)
     ]
 
-    return get_duplication_benefit_aggregation(BenefitConsumption, columns=db_columns, json_ext_keys=json_keys, filters=filters)
+    return get_duplication_benefit_aggregation(
+        BenefitConsumption, columns=db_columns, json_ext_keys=json_keys, filters=filters,
+        queryset=benefits_in_scope(user),
+    )
 
 
 def get_duplication_aggregation(model: Union[Type[ExtendableModel], Type[HistoryModel]], columns: List[str] = None,
-                                json_ext_keys: List[str] = None, filters: List = None):
-    queryset = model.objects.filter(*filters)
+                                json_ext_keys: List[str] = None, filters: List = None, queryset=None):
+    queryset = (queryset if queryset is not None else model.objects.all()).filter(*filters)
     if json_ext_keys:
         json_ext_aggr = {key: Cast(KeyTextTransform(key, 'json_ext'), models.TextField())
                          for key in json_ext_keys}
@@ -325,9 +376,9 @@ def get_duplication_aggregation(model: Union[Type[ExtendableModel], Type[History
 def get_duplication_benefit_aggregation(
     model: Union[Type[ExtendableModel], Type[HistoryModel]],
     columns: List[str] = None,
-    json_ext_keys: List[str] = None, filters: List = None
+    json_ext_keys: List[str] = None, filters: List = None, queryset=None
 ):
-    queryset = model.objects.filter(*filters).select_related('individual')
+    queryset = (queryset if queryset is not None else model.objects.all()).filter(*filters).select_related('individual')
     if json_ext_keys:
         json_ext_aggr = {key: Cast(KeyTextTransform(key, 'individual__json_ext'), models.TextField())
                          for key in json_ext_keys}
